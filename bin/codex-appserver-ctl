@@ -54,6 +54,7 @@ Usage:
   codex-appserver-ctl auth list [--target SSH_TARGET]
   codex-appserver-ctl auth current [--target SSH_TARGET]
   codex-appserver-ctl auth save NAME [--target SSH_TARGET] [--force] [--dry-run]
+  codex-appserver-ctl save NAME [--target SSH_TARGET] [--force] [--dry-run]
   codex-appserver-ctl auth use [NAME] [--target SSH_TARGET] [--restart=true|false] [--dry-run]
 
 Targets:
@@ -1172,6 +1173,8 @@ def run_remote(target: str, args: Sequence[str]) -> None:
 
 def main(argv: Sequence[str]) -> None:
     target, argv = ssh_target(argv)
+    if argv and argv[0] == "save":
+        argv = ["auth"] + list(argv)
     if target is not None:
         run_remote(target, argv)
     if not argv or argv[0] in {"-h", "--help"}:
@@ -1248,6 +1251,11 @@ def main(argv: Sequence[str]) -> None:
             die("unknown auth command: %s" % command)
         return
 
+    if not argv[0].startswith("-") and argv[0].lower() not in {
+        "this", "home", "local", "host", "all", "both", "stamcord", "shared", "deployment",
+        "1", "0", "true", "false", "yes", "no", "on", "off",
+    }:
+        die("unknown command: %s; use --help for available commands" % argv[0])
     options = parse_options(argv)
     positionals = list(options.positionals)
     if positionals and positionals[0].lower() in {"this", "home", "local", "host", "all", "both", "stamcord", "shared", "deployment"}:

@@ -67,6 +67,13 @@ codex-appserver-ctl auth save personal
 codex-appserver-ctl auth use personal
 ```
 
+You can also use `save NAME` as a short form of `auth save NAME`.
+
+```sh
+codex-appserver-ctl save personal
+codex-appserver-ctl save personal --target MY_SERVER
+```
+
 To use the selection menu, run `auth use` in a terminal.
 For scripts, specify the profile name.
 

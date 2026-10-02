@@ -25,6 +25,29 @@ class CommandTests(unittest.TestCase):
             self.cli['main'](['auth', 'use', 'home'])
         self.assertEqual([c[0] for c in calls], ['work', 'home'])
 
+    def test_save_short_form_does_not_enter_restart_parser(self):
+        calls = []
+        with patch.dict(self.globals, auth_save=lambda *a: calls.append(a),
+                        control_home=lambda *a: self.fail('save must not restart')):
+            self.cli['main'](['save', 'work', '--dry-run'])
+            self.cli['main'](['auth', 'save', 'work', '--dry-run'])
+        self.assertEqual(calls[0], calls[1])
+        self.assertEqual(calls[0], ('work', False, True, 120))
+
+    def test_save_short_form_is_normalized_before_ssh(self):
+        calls = []
+        def remote(target, args):
+            calls.append((target, args))
+            raise SystemExit(0)
+        with patch.dict(self.globals, run_remote=remote):
+            with self.assertRaises(SystemExit):
+                self.cli['main'](['save', 'work', '--target', 'MY_SERVER'])
+        self.assertEqual(calls, [('MY_SERVER', ['auth', 'save', 'work'])])
+
+    def test_unknown_command_has_relevant_error(self):
+        with self.assertRaisesRegex(self.cli['UserError'], 'unknown command: typo'):
+            self.cli['main'](['typo', 'work'])
+
     def test_ssh_destination_parsing(self):
         parse = self.cli['ssh_target']
         self.assertEqual(parse(['auth', 'list', '--target=MY_SERVER']), ('MY_SERVER', ['auth', 'list']))
