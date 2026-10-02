@@ -139,7 +139,30 @@ codex-appserver-ctl status --target user@host
 codex-appserver-ctl auth use work --target=MY_SERVER --dry-run
 ```
 
-The remote host must have this tool in `PATH` or `~/.local/bin`.
+The tool first checks `PATH` and `~/.local/bin` on the remote host.
+If the tool is missing, it asks for permission to install.
+If the remote version does not support the requested command, it asks for permission to update.
+
+```text
+Install this local version on MY_SERVER at ~/.local/bin/codex-appserver-ctl?
+Install/update? [y/N]
+```
+
+Enter `y` or `yes` to permit installation and execution of the original command.
+Any other answer stops the command without changes.
+Without an interactive terminal, the tool stops without installation.
+With `--dry-run`, the tool reports the missing installation without changes.
+
+Installation copies the local script through SSH.
+It does not download a version from GitHub or install Codex.
+The remote host requires Python 3.9 or later.
+The destination is `~/.local/bin/codex-appserver-ctl`.
+The installer saves an existing file as `codex-appserver-ctl.backup.*` before replacement.
+It refuses to replace a symbolic link or a file owned by another user.
+After installation, the command uses the installed file directly.
+This prevents an older version in `PATH` from taking priority for that command.
+If installation fails, the original command does not run.
+
 The command uses profiles on the remote host.
 It does not send local authentication files to that host.
 The command controls Codex for the SSH user.
@@ -188,7 +211,9 @@ git pull --ff-only
 ./install.sh
 ```
 
-An SSH command does not update the remote installation.
+An SSH command asks to update only if the requested command requires an update.
+It does not check GitHub for newer versions.
+For other source changes, update the remote installation with the commands above.
 
 ## Control the app-server
 

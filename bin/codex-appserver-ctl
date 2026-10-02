@@ -59,7 +59,9 @@ Usage:
 Targets:
   Omit --target to operate on this computer.
   --target SSH_TARGET connects using SSH (for example, MY_SERVER or user@host).
-  The remote host must have codex-appserver-ctl installed; its profiles are used.
+  Missing or incompatible remote tools prompt for installation of this version.
+  Installation requires confirmation and Python 3.9 or later on the target.
+  Remote commands use profiles on the remote host.
   SSH configuration, authentication, and host verification follow normal ssh.
 
 Control policy:
@@ -1046,7 +1048,97 @@ def ssh_target(args: Sequence[str]) -> Tuple[Optional[str], List[str]]:
     return target, remaining
 
 
+REMOTE_LOOKUP = 'ctl=$(command -v codex-appserver-ctl) || ctl="$HOME/.local/bin/codex-appserver-ctl"; '
+REMOTE_INSTALLED = 'ctl="$HOME/.local/bin/codex-appserver-ctl"; '
+REMOTE_INSTALLER = r"""
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+if sys.version_info < (3, 9):
+    sys.exit("Python 3.9 or later is required on target")
+source = sys.stdin.buffer.read()
+compile(source, "codex-appserver-ctl", "exec")
+directory = Path.home() / ".local" / "bin"
+directory.mkdir(parents=True, exist_ok=True)
+destination = directory / "codex-appserver-ctl"
+if destination.is_symlink() or (destination.exists() and not destination.is_file()):
+    sys.exit("Refusing to replace a symlink or non-regular file: " + str(destination))
+if destination.exists() and destination.stat().st_uid != os.getuid():
+    sys.exit("Refusing to replace a file owned by another user")
+fd, temporary = tempfile.mkstemp(prefix=".codex-appserver-ctl.", dir=directory)
+try:
+    with os.fdopen(fd, "wb") as file:
+        file.write(source)
+        file.flush()
+        os.fsync(file.fileno())
+    os.chmod(temporary, 0o755)
+    if destination.exists():
+        fd, backup = tempfile.mkstemp(prefix="codex-appserver-ctl.backup.", dir=directory)
+        os.close(fd)
+        shutil.copy2(destination, backup)
+        print("Previous version: " + backup)
+    os.replace(temporary, destination)
+    print("Installed: " + str(destination))
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+"""
+
+
+def remote_command_supported(help_text: str, args: Sequence[str]) -> bool:
+    if not args or args[0] in {"-h", "--help", "status", "true", "false"}:
+        return True
+    if args[0] == "auth":
+        return len(args) < 2 or args[1] != "login" or "auth login" in help_text
+    if args[0] == "remote-control":
+        return "remote-control" in help_text and (len(args) < 2 or args[1] in help_text)
+    if args[0] in {"restart", "stop"}:
+        return True  # Older scripts accept home true|false.
+    return args[0] in help_text
+
+
+def prepare_remote(target: str, args: Sequence[str]) -> bool:
+    command = REMOTE_LOOKUP + '[ -x "$ctl" ] || exit 127; "$ctl" --help'
+    try:
+        result = subprocess.run(["ssh", "--", target, command], capture_output=True, text=True, check=False)
+    except OSError as exc:
+        die("could not run ssh: %s" % exc)
+    if result.returncode == 0 and remote_command_supported(result.stdout, args):
+        return False
+    if result.returncode not in {0, 127}:
+        if result.stderr:
+            print(result.stderr.rstrip(), file=sys.stderr)
+        raise SystemExit(result.returncode)
+    reason = "is not installed" if result.returncode == 127 else "does not support the requested command"
+    print("codex-appserver-ctl on %s %s." % (target, reason), file=sys.stderr)
+    if "--dry-run" in args:
+        die("remote installation is required; dry-run does not install or update files")
+    if not sys.stdin.isatty():
+        die("remote installation requires confirmation in an interactive terminal")
+    print("Install this local version on %s at ~/.local/bin/codex-appserver-ctl?" % target, file=sys.stderr)
+    print("Existing files at that path will be backed up. Then the requested command will run.", file=sys.stderr)
+    print("The target requires Python 3.9 or later. Authentication files will not be copied.", file=sys.stderr)
+    try:
+        answer = input("Install/update? [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in {"y", "yes"}:
+        die("remote installation declined; no files changed")
+    command = "python3 -c " + shlex.quote(REMOTE_INSTALLER)
+    try:
+        result = subprocess.run(["ssh", "-T", "--", target, command], input=SCRIPT.read_bytes(), check=False)
+    except OSError as exc:
+        die("remote installation failed: %s" % exc)
+    if result.returncode:
+        die("remote installation failed (exit %s); requested command was not run" % result.returncode)
+    return True
+
+
 def run_remote(target: str, args: Sequence[str]) -> None:
+    installed = prepare_remote(target, args)
     # Older host scripts still require the positional home target.
     legacy = list(args)
     if legacy[:1] == ["auth"] and len(legacy) >= 2:
@@ -1058,8 +1150,8 @@ def run_remote(target: str, args: Sequence[str]) -> None:
     elif legacy and legacy[0] not in {"--help", "-h", "remote-control", "start"}:
         legacy.insert(0, "home")
     command = (
-        'ctl=$(command -v codex-appserver-ctl) || ctl="$HOME/.local/bin/codex-appserver-ctl"; '
-        '[ -x "$ctl" ] || { echo "codex-appserver-ctl is not installed on target" >&2; exit 127; }; '
+        (REMOTE_INSTALLED if installed else REMOTE_LOOKUP)
+        + '[ -x "$ctl" ] || { echo "codex-appserver-ctl is not installed on target" >&2; exit 127; }; '
         'ctl_help=$("$ctl" --help) || exit $?; '
         'case "$ctl_help" in *"auth use [NAME]"*) exec "$ctl" '
         + shlex.join(args)

@@ -40,7 +40,7 @@ class CommandTests(unittest.TestCase):
             executable = Path(directory) / 'codex-appserver-ctl'
             marker = Path(directory) / 'injection'
             for modern in [True, False]:
-                help_text = 'auth use [NAME]' if modern else 'auth use TARGET [NAME]'
+                help_text = ('auth use [NAME]' if modern else 'auth use TARGET [NAME]') + ' auth login doctor targets logs remote-control pair bootstrap'
                 executable.write_text(
                     '#!/usr/bin/env python3\nimport sys,json\n'
                     'if sys.argv[1:]==["--help"]: print(' + repr(help_text) + ')\n'
@@ -64,6 +64,8 @@ class CommandTests(unittest.TestCase):
                             env={**os.environ, 'PATH': directory + ':' + os.environ['PATH']},
                         )
                         self.assertEqual(result.returncode, 0, result.stderr)
+                        if kwargs.get('capture_output'):
+                            return result
                         captured.extend(json.loads(result.stdout))
                         return result
 
@@ -308,6 +310,78 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(result.exception.code, 1)
             self.assertIn('FAIL auth', output.getvalue())
             self.assertNotIn('DO_NOT_PRINT_ME', output.getvalue())
+
+
+
+class RemoteInstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.cli = runpy.run_path(str(ROOT / 'bin/codex-appserver-ctl'))
+        self.globals = self.cli['main'].__globals__
+
+    def test_missing_remote_prompts_installs_and_retries(self):
+        actual_run = subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            commands = []
+            def ssh(command, **kwargs):
+                commands.append(command)
+                if kwargs.get('capture_output'):
+                    return subprocess.CompletedProcess(command, 127, '', '')
+                result = actual_run(['/bin/sh', '-c', command[-1]],
+                                    input=kwargs.get('input'), capture_output=True,
+                                    env={**os.environ, 'HOME': str(home)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return result
+            with patch.object(subprocess, 'run', ssh), patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y') as prompt:
+                with self.assertRaises(SystemExit) as result:
+                    self.cli['main'](['--help', '--target', 'MY_SERVER'])
+            self.assertEqual(result.exception.code, 0)
+            prompt.assert_called_once()
+            self.assertEqual(len(commands), 3)
+            self.assertEqual((home / '.local/bin/codex-appserver-ctl').read_bytes(), (ROOT / 'bin/codex-appserver-ctl').read_bytes())
+            self.assertIn('ctl="$HOME/.local/bin/codex-appserver-ctl"', commands[-1][-1])
+
+    def test_decline_noninteractive_and_dry_run_do_not_install(self):
+        for tty, answer, args in [(True, 'n', ['doctor']), (False, 'y', ['doctor']),
+                                  (True, 'y', ['auth', 'login', 'work', '--dry-run'])]:
+            with self.subTest(tty=tty, args=args), patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 127, '', '')) as run, patch('sys.stdin.isatty', return_value=tty), patch('builtins.input', return_value=answer) as prompt:
+                with self.assertRaises(self.cli['UserError']):
+                    self.cli['prepare_remote']('MY_SERVER', args)
+                self.assertEqual(run.call_count, 1)
+                if not tty or '--dry-run' in args:
+                    prompt.assert_not_called()
+
+    def test_unsupported_remote_prompts_for_update(self):
+        results = [subprocess.CompletedProcess([], 0, 'auth use TARGET [NAME]', ''),
+                   subprocess.CompletedProcess([], 0)]
+        with patch.object(subprocess, 'run', side_effect=results) as run, patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='yes'):
+            self.assertTrue(self.cli['prepare_remote']('MY_SERVER', ['auth', 'login', 'work']))
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.kwargs['input'], (ROOT / 'bin/codex-appserver-ctl').read_bytes())
+
+    def test_install_failure_does_not_retry_command(self):
+        results = [subprocess.CompletedProcess([], 127, '', ''), subprocess.CompletedProcess([], 1)]
+        with patch.object(subprocess, 'run', side_effect=results) as run, patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y'):
+            with self.assertRaises(self.cli['UserError']):
+                self.cli['main'](['auth', 'login', 'work', '--target', 'MY_SERVER'])
+            self.assertEqual(run.call_count, 2)
+
+    def test_remote_installer_backs_up_and_refuses_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory); destination = home / '.local/bin/codex-appserver-ctl'
+            destination.parent.mkdir(parents=True)
+            destination.write_text('old version')
+            source = (ROOT / 'bin/codex-appserver-ctl').read_bytes()
+            result = subprocess.run(['python3', '-c', self.cli['REMOTE_INSTALLER']], input=source,
+                                    env={**os.environ, 'HOME': str(home)}, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            backups = list(destination.parent.glob('codex-appserver-ctl.backup.*'))
+            self.assertEqual(backups[0].read_text(), 'old version')
+            destination.unlink(); destination.symlink_to(backups[0])
+            result = subprocess.run(['python3', '-c', self.cli['REMOTE_INSTALLER']], input=source,
+                                    env={**os.environ, 'HOME': str(home)}, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(backups[0].read_text(), 'old version')
 
 
 
