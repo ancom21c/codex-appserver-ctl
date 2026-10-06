@@ -43,7 +43,7 @@ esac
 fn cli(root: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_codex-appserver-ctl"));
     c.args(args);
-    if args.first() == Some(&"update") {
+    if args.first() == Some(&"update") && args.get(1) == Some(&"codex") {
         c.arg("--internal-direct");
     }
     c.env("HOME", root).env(
@@ -55,7 +55,7 @@ fn cli(root: &Path, args: &[&str]) -> Command {
 #[test]
 fn update_installs_official_script_then_restarts() {
     let t = fixture();
-    let out = cli(t.path(), &["update"]).output().unwrap();
+    let out = cli(t.path(), &["update", "codex"]).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -68,13 +68,16 @@ fn update_installs_official_script_then_restarts() {
 fn update_failure_never_restarts_and_no_restart_option_works() {
     for flag in ["TEST_DOWNLOAD_FAIL", "TEST_INSTALL_FAIL"] {
         let t = fixture();
-        let out = cli(t.path(), &["update"]).env(flag, "1").output().unwrap();
+        let out = cli(t.path(), &["update", "codex"])
+            .env(flag, "1")
+            .output()
+            .unwrap();
         assert!(!out.status.success());
         assert!(!t.path().join("restarted").exists());
         assert!(!t.path().join(".local/bin/codex").exists());
     }
     let t = fixture();
-    assert!(cli(t.path(), &["update", "--no-restart"])
+    assert!(cli(t.path(), &["update", "codex", "--no-restart"])
         .status()
         .unwrap()
         .success());
@@ -83,7 +86,7 @@ fn update_failure_never_restarts_and_no_restart_option_works() {
 #[test]
 fn update_dry_run_does_not_install() {
     let t = fixture();
-    assert!(cli(t.path(), &["update", "--dry-run"])
+    assert!(cli(t.path(), &["update", "codex", "--dry-run"])
         .status()
         .unwrap()
         .success());
@@ -97,4 +100,98 @@ fn usage_runs_without_codex_or_ccusage() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["total"]["total_tokens"], 0);
     assert_eq!(value["files"], 0);
+}
+
+#[test]
+fn limits_parallel_refresh_and_failure_are_isolated() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path();
+    fs::create_dir_all(home.join(".codex/accounts")).unwrap();
+    for n in ["alpha", "beta", "slow"] {
+        let path = home.join(format!(".codex/accounts/{n}.json"));
+        fs::write(&path, format!(r#"{{"name":"{n}","token":"old"}}"#)).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::os::unix::fs::symlink("accounts/alpha.json", home.join(".codex/auth.json")).unwrap();
+    let fake = home.join("codex");
+    executable(
+        &fake,
+        r#"#!/usr/bin/env python3
+import json, os, sys, time
+p=os.path.join(os.environ['CODEX_HOME'],'auth.json')
+a=json.load(open(p))
+for line in sys.stdin:
+ v=json.loads(line)
+ if 'id' not in v: continue
+ method=v['method']
+ if method=='account/rateLimits/read':
+  if a['name']=='slow': time.sleep(5)
+  else: time.sleep(.35)
+  a['token']='new'
+  with open(p,'w') as f: json.dump(a,f)
+  result={'rateLimits':{'secondary':{'windowDurationMins':10080,'usedPercent':42,'resetsAt':1800000000}}}
+ else: result={}
+ print(json.dumps({'id':v['id'],'result':result}),flush=True)
+"#,
+    );
+    let start = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_codex-appserver-ctl"))
+        .args(["limits", "--timeout", "1"])
+        .env("HOME", home)
+        .env("CODEX_APPSERVER_HOST_CODEX", fake)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        start.elapsed().as_secs_f64() < 2.5,
+        "checks must run concurrently"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("42.0%") && text.contains("58.0%") && text.contains("timed out"),
+        "{text}"
+    );
+    assert!(!text.contains("\\x1b"));
+    let alpha: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join(".codex/accounts/alpha.json")).unwrap())
+            .unwrap();
+    assert_eq!(alpha["token"], "new");
+    assert_eq!(
+        fs::read_link(home.join(".codex/auth.json")).unwrap(),
+        Path::new("accounts/alpha.json")
+    );
+}
+
+#[test]
+fn self_update_uses_release_installer_and_current_prefix() {
+    let t = fixture();
+    let bin = t.path().join("custom/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let ctl = bin.join("codex-appserver-ctl");
+    fs::copy(env!("CARGO_BIN_EXE_codex-appserver-ctl"), &ctl).unwrap();
+    executable(
+        &t.path().join("installer"),
+        r#"#!/bin/sh
+[ "$1" = --prefix ] || exit 3
+printf '#!/bin/sh\necho "codex-appserver-ctl NEW"\n' > "$2/bin/codex-appserver-ctl.tmp"
+chmod +x "$2/bin/codex-appserver-ctl.tmp"
+mv "$2/bin/codex-appserver-ctl.tmp" "$2/bin/codex-appserver-ctl"
+"#,
+    );
+    let out = Command::new(&ctl)
+        .arg("update")
+        .env("HOME", t.path())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", t.path().join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("NEW"));
+    assert!(!t.path().join("restarted").exists());
 }

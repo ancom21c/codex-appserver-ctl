@@ -169,12 +169,43 @@ Read the detached log to check the result:
 codex-appserver-ctl logs
 ```
 
+## Self-update
+
+```sh
+codex-appserver-ctl update --dry-run
+codex-appserver-ctl update --timeout 900
+```
+
+Downloads and runs the upstream release's `install.sh`, installing the latest
+published release in the current `PREFIX/bin` location. The release installer
+verifies the archive checksum and keeps a backup. Checkout binaries must first
+be installed using `./install.sh --source` or `--binary FILE`.
+New PR features become available through self-update after a release is published.
+
+## Weekly account limits
+
+```sh
+codex-appserver-ctl limits
+codex-appserver-ctl limits --timeout 30
+codex-appserver-ctl limits --watch
+```
+
+Checks all saved accounts and the active account concurrently through isolated
+Codex app-servers. Displays weekly used/remaining percentages and reset times
+in the local timezone. `*` marks the active account. Terminal output shows an
+animated progress indicator until every account finishes. `--watch` enables
+keyboard refresh (`r`) and quit (`q`); redirected output remains a plain table.
+Identical credential files share one request. Managed token refreshes are saved
+only if the original files still match, without switching the active account or
+restarting an existing server. Unsupported weekly windows show N/A; individual
+failures remain visible and produce a nonzero exit status. Ctrl-C cancels checks.
+
 ## Update Codex CLI
 
 ```sh
-codex-appserver-ctl update --timeout 900
-codex-appserver-ctl update --no-restart --timeout 900
-codex-appserver-ctl update --dry-run
+codex-appserver-ctl update codex --timeout 900
+codex-appserver-ctl update codex --no-restart --timeout 900
+codex-appserver-ctl update codex --dry-run
 ```
 
 The tool downloads and runs the [official Codex installer](https://chatgpt.com/codex/install.sh).

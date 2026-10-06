@@ -1,3 +1,4 @@
+mod limits;
 mod usage;
 use serde_json::Value;
 use std::{
@@ -20,7 +21,7 @@ fn err(message: impl Into<String>) -> Box<dyn Error> {
     message.into().into()
 }
 const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
-const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start|stop|pair|enable|disable|status|bootstrap\n  update [--no-restart] [--timeout N] [--dry-run]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  --version\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Remote binary installation requires curl, tar, and a SHA-256 tool.\nUsage reads local history. It does not query remaining account limits.\n";
+const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start|stop|pair|enable|disable|status|bootstrap\n  update [--timeout N] [--dry-run]\n  update codex [--no-restart] [--timeout N] [--dry-run]\n  limits [--timeout N] [--watch]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  --version\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Remote binary installation requires curl, tar, and a SHA-256 tool.\nUsage reads local history. It does not query remaining account limits.\n";
 struct App {
     home: PathBuf,
     data: PathBuf,
@@ -584,7 +585,59 @@ impl App {
         }
         run(&mut self.command(&args)?, o.timeout)
     }
-    fn update(&mut self, o: &Options) -> Result<()> {
+    fn update_self(&self, o: &Options) -> Result<()> {
+        const URL: &str =
+            "https://github.com/ancom21c/codex-appserver-ctl/releases/latest/download/install.sh";
+        let executable = env::current_exe()?;
+        let bin = executable
+            .parent()
+            .ok_or_else(|| err("missing executable directory"))?;
+        if bin.file_name().is_none_or(|n| n != "bin") {
+            return Err(err("self-update requires installation in PREFIX/bin; use install.sh --binary for a checkout"));
+        }
+        let prefix = bin.parent().ok_or_else(|| err("missing install prefix"))?;
+        if o.dry {
+            println!("dry-run installer={URL} prefix={}", prefix.display());
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("install.sh");
+        run(
+            Command::new("curl")
+                .args([
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--location",
+                    "--proto",
+                    "=https",
+                    "--proto-redir",
+                    "=https",
+                    "--connect-timeout",
+                    "10",
+                    "--max-time",
+                    "60",
+                    "--output",
+                ])
+                .arg(&script)
+                .arg(URL),
+            o.timeout,
+        )?;
+        run(
+            Command::new("sh")
+                .arg(&script)
+                .arg("--prefix")
+                .arg(prefix)
+                .env("HOME", &self.home),
+            o.timeout,
+        )?;
+        println!(
+            "{}",
+            capture(Command::new(&executable).arg("--version"), 10)?.trim()
+        );
+        Ok(())
+    }
+    fn update_codex(&mut self, o: &Options) -> Result<()> {
         if o.dry {
             println!(
                 "dry-run installer={INSTALL_URL} destination={} restart={}",
@@ -594,7 +647,7 @@ impl App {
             return Ok(());
         }
         if o.restart && !o.internal && self.within()? {
-            return self.schedule(&["update"], o);
+            return self.schedule(&["update", "codex"], o);
         }
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("install.sh");
@@ -1239,6 +1292,9 @@ fn dispatch(app: &mut App, args: &[String]) -> Result<()> {
     if args[0] == "usage" {
         return usage::report(&app.data, &args[1..]);
     }
+    if args[0] == "limits" {
+        return limits::report(app, &args[1..]);
+    }
     if args[0] == "logs" {
         return logs(app, &args[1..]);
     }
@@ -1275,7 +1331,18 @@ fn dispatch(app: &mut App, args: &[String]) -> Result<()> {
         }
         "start" | "restart" | "stop" if o.pos.is_empty() => app.control(&args[0], &o),
         "status" if o.pos.is_empty() => app.status(),
-        "update" if o.pos.is_empty() => app.update(&o),
+        "update" if o.pos.is_empty() => {
+            if o.force
+                || o.internal
+                || args
+                    .iter()
+                    .any(|s| s.starts_with("--restart") || s == "--no-restart")
+            {
+                return Err(err("self-update accepts only --timeout N and --dry-run; use update codex for Codex CLI updates"));
+            }
+            app.update_self(&o)
+        }
+        "update" if o.pos == ["codex"] => app.update_codex(&o),
         "remote-control" if o.pos.len() == 1 => app.remote_control(&o.pos[0], &o),
         "doctor" if o.pos.is_empty() => app.doctor(),
         "targets" if o.pos.is_empty() => {
