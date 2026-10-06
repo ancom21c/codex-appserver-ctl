@@ -1,7 +1,9 @@
 use crate::{atomic, err, options, App, Result};
 use chrono::{Local, TimeZone};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     io::{self, IsTerminal, Read, Write},
     os::{fd::AsRawFd, unix::fs::PermissionsExt},
@@ -195,7 +197,19 @@ fn check(app: &App, profile: &Profile, timeout: u64) -> std::result::Result<Valu
 fn clean(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(80).collect()
 }
-fn rows(value: &Value) -> Vec<[String; 4]> {
+#[derive(Clone, Serialize, Deserialize)]
+struct Window {
+    id: String,
+    used: f64,
+    reset: Option<i64>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct Cached {
+    updated_at: i64,
+    windows: Vec<Window>,
+}
+type Cache = HashMap<String, Cached>;
+fn rows(value: &Value) -> Vec<Window> {
     let mut buckets = Vec::new();
     if let Some(map) = value.get("rateLimitsByLimitId").and_then(Value::as_object) {
         for (id, bucket) in map {
@@ -223,27 +237,185 @@ fn rows(value: &Value) -> Vec<[String; 4]> {
             else {
                 continue;
             };
-            let remaining = (100. - used).clamp(0., 100.);
-            let reset = w
-                .get("resetsAt")
-                .and_then(Value::as_i64)
-                .and_then(|s| Local.timestamp_opt(s, 0).single())
-                .map(|t| t.format("%Y-%m-%d %H:%M %:z").to_string())
-                .unwrap_or_else(|| "N/A".into());
-            let filled = (remaining / 10.).round() as usize;
-            rows.push([
-                clean(id),
-                format!("{used:.1}%"),
-                format!(
-                    "[{}{}] {remaining:.1}%",
-                    "#".repeat(filled),
-                    "-".repeat(10 - filled)
-                ),
-                reset,
-            ]);
+            rows.push(Window {
+                id: clean(id),
+                used,
+                reset: w.get("resetsAt").and_then(Value::as_i64),
+            });
         }
     }
     rows
+}
+fn load_cache(app: &App) -> Cache {
+    let path = app.data.join("appserver-ctl-limits.json");
+    if !app.secure(&path) {
+        return Cache::new();
+    }
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+fn percentage(n: f64) -> String {
+    if n.fract() == 0. {
+        format!("{n:.0}%")
+    } else {
+        format!("{n:.1}%")
+    }
+}
+fn reset_at(reset: Option<i64>) -> String {
+    let Some(timestamp) = reset else {
+        return "N/A".into();
+    };
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    let mut text = [0u8; 64];
+    unsafe {
+        if libc::localtime_r(&timestamp, &mut local).is_null() {
+            return "N/A".into();
+        }
+        let size = libc::strftime(
+            text.as_mut_ptr().cast(),
+            text.len(),
+            c"%Y-%m-%d %H:%M %Z".as_ptr(),
+            &local,
+        );
+        clean(&String::from_utf8_lossy(&text[..size]))
+    }
+}
+fn reset_in(reset: Option<i64>, now: i64) -> String {
+    match reset {
+        Some(t) if t <= now => "due".into(),
+        Some(t) => {
+            let minutes = t.saturating_sub(now) / 60;
+            format!(
+                "{}d {}h {}m",
+                minutes / 1440,
+                minutes / 60 % 24,
+                minutes % 60
+            )
+        }
+        None => "N/A".into(),
+    }
+}
+fn table(
+    profiles: &[Profile],
+    cache: &Cache,
+    statuses: &HashMap<String, String>,
+    refreshing: bool,
+    unicode: bool,
+) -> String {
+    let now = Local::now().timestamp();
+    let mut table: Vec<Vec<String>> = vec![[
+        "PROFILE",
+        "CURRENT",
+        "LIMIT",
+        "WEEKLY USED",
+        "REMAINING",
+        "RESETS AT",
+        "RESET IN",
+        "STATUS",
+        "LAST UPDATED",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()];
+    for p in profiles {
+        let cached = cache.get(&p.name);
+        let status = if refreshing {
+            "REFRESHING"
+        } else {
+            statuses.get(&p.name).map(String::as_str).unwrap_or("N/A")
+        };
+        let updated = cached
+            .and_then(|c| Local.timestamp_opt(c.updated_at, 0).single())
+            .map(|t| t.format("%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "-".into());
+        let windows = cached.map(|c| c.windows.as_slice()).unwrap_or_default();
+        if windows.is_empty() {
+            table.push(vec![
+                p.name.clone(),
+                if p.current { "*" } else { "" }.into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                status.into(),
+                updated,
+            ]);
+        } else {
+            for w in windows {
+                let remaining = (100. - w.used).clamp(0., 100.);
+                let filled = (remaining / 10.).round() as usize;
+                let gauge = format!(
+                    "[{}{}] {}",
+                    if unicode { "█" } else { "#" }.repeat(filled),
+                    if unicode { "░" } else { "-" }.repeat(10 - filled),
+                    percentage(remaining)
+                );
+                let reset = reset_at(w.reset);
+                table.push(vec![
+                    p.name.clone(),
+                    if p.current { "*" } else { "" }.into(),
+                    clean(&w.id),
+                    percentage(w.used),
+                    gauge,
+                    reset,
+                    reset_in(w.reset, now),
+                    status.into(),
+                    updated.clone(),
+                ]);
+            }
+        }
+    }
+    let widths: Vec<_> = (0..9)
+        .map(|i| table.iter().map(|r| r[i].chars().count()).max().unwrap())
+        .collect();
+    let mut output = String::new();
+    let borders = if unicode {
+        ["┌", "┬", "┐", "├", "┼", "┤", "└", "┴", "┘", "─", "│"]
+    } else {
+        ["+", "+", "+", "+", "+", "+", "+", "+", "+", "-", "|"]
+    };
+    let border = |left: &str, join: &str, right: &str| {
+        format!(
+            "{}{}{}\n",
+            left,
+            widths
+                .iter()
+                .map(|w| borders[9].repeat(w + 2))
+                .collect::<Vec<_>>()
+                .join(join),
+            right
+        )
+    };
+    output.push_str(&border(borders[0], borders[1], borders[2]));
+    for (n, row) in table.iter().enumerate() {
+        output.push_str(borders[10]);
+        for (i, cell) in row.iter().enumerate() {
+            output.push_str(&format!(
+                " {cell}{} {}",
+                " ".repeat(widths[i].saturating_sub(cell.chars().count())),
+                borders[10]
+            ));
+        }
+        output.push('\n');
+        if n == 0 {
+            output.push_str(&border(borders[3], borders[4], borders[5]));
+        }
+    }
+    output.push_str(&border(borders[6], borders[7], borders[8]));
+    output
+}
+fn terminal_columns() -> usize {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
+        && size.ws_col > 0
+    {
+        size.ws_col as usize
+    } else {
+        80
+    }
 }
 fn report_once(app: &App, args: &[String]) -> Result<()> {
     let o = options(args)?;
@@ -311,9 +483,31 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         }
     }
     let start = Instant::now();
-    let tty = io::stderr().is_terminal();
+    let tty = io::stdout().is_terminal();
+    let progress = io::stderr().is_terminal();
+    let mut cache = load_cache(app);
+    cache.retain(|name, entry| {
+        profiles.iter().any(|p| &p.name == name)
+            && entry.windows.len() <= 32
+            && entry
+                .windows
+                .iter()
+                .all(|w| w.used.is_finite() && w.used >= 0.)
+    });
+    let mut previous_lines = 0;
+    if tty {
+        let previous = table(&profiles, &cache, &HashMap::new(), true, true);
+        let columns = terminal_columns();
+        previous_lines = previous
+            .lines()
+            .map(|line| line.chars().count().div_ceil(columns).max(1))
+            .sum::<usize>();
+        print!("{previous}");
+        io::stdout().flush()?;
+    }
     let (tx, rx) = mpsc::channel();
     let mut results = vec![None; groups.len()];
+    let mut updated_at = vec![0; groups.len()];
     thread::scope(|scope| {
         for (i, profile) in groups.iter().enumerate() {
             let tx = tx.clone();
@@ -325,9 +519,9 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         let mut done = 0;
         let mut frame = 0;
         while done < groups.len() {
-            if tty {
+            if progress {
                 eprint!(
-                    "\r\x1b[2K {} Checking weekly limits {}/{} | {:.1}s elapsed",
+                    "\r\x1b[2K {} Refreshing weekly limits {}/{} | {:.1}s elapsed",
                     ["|", "/", "-", "\\"][frame % 4],
                     done,
                     groups.len(),
@@ -339,6 +533,7 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok((i, result)) => {
                     results[i] = Some(result);
+                    updated_at[i] = Local::now().timestamp();
                     done += 1;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -346,45 +541,30 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
             }
         }
     });
-    if tty {
+    if progress {
         eprint!("\r\x1b[2K");
     }
     if CANCEL.load(Ordering::Relaxed) {
         std::process::exit(130);
     }
-    let mut table = vec![[
-        "ACCOUNT".into(),
-        "LIMIT".into(),
-        "USED".into(),
-        "REMAINING".into(),
-        "RESET (LOCAL)".into(),
-    ]];
+    let mut statuses = HashMap::new();
     let mut failed = false;
-    for p in profiles {
+    for p in &profiles {
         let i = groups.iter().position(|g| g.bytes == p.bytes).unwrap();
-        let name = format!("{}{}", if p.current { "* " } else { "  " }, p.name);
         match results[i].as_ref() {
             Some(Ok(value)) => {
-                let rows = rows(value);
-                if rows.is_empty() {
-                    table.push([
-                        name,
-                        "N/A".into(),
-                        "-".into(),
-                        "-".into(),
-                        "No weekly window".into(),
-                    ]);
-                } else {
-                    for r in rows {
-                        table.push([
-                            name.clone(),
-                            r[0].clone(),
-                            r[1].clone(),
-                            r[2].clone(),
-                            r[3].clone(),
-                        ]);
-                    }
-                }
+                let windows = rows(value);
+                statuses.insert(
+                    p.name.clone(),
+                    if windows.is_empty() { "N/A" } else { "OK" }.into(),
+                );
+                cache.insert(
+                    p.name.clone(),
+                    Cached {
+                        updated_at: updated_at[i],
+                        windows,
+                    },
+                );
             }
             other => {
                 failed = true;
@@ -392,31 +572,41 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
                     .and_then(|r| r.as_ref().err())
                     .map(String::as_str)
                     .unwrap_or("worker failed");
-                table.push([name, "ERROR".into(), "-".into(), "-".into(), status.into()]);
+                statuses.insert(
+                    p.name.clone(),
+                    format!(
+                        "{}: {status}",
+                        if cache.contains_key(&p.name) {
+                            "STALE"
+                        } else {
+                            "ERROR"
+                        }
+                    ),
+                );
             }
         }
     }
-    let widths: Vec<_> = (0..5)
-        .map(|i| table.iter().map(|r| r[i].chars().count()).max().unwrap())
-        .collect();
+    // Cache contains only quota metrics and timestamps, never authentication data.
+    if let Err(e) = atomic(
+        &app.data.join("appserver-ctl-limits.json"),
+        &serde_json::to_vec(&cache)?,
+    ) {
+        eprintln!("warning: limits cache could not be saved: {e}");
+    }
+    if tty {
+        print!("\x1b[{previous_lines}A\r\x1b[J");
+    }
+    print!("{}", table(&profiles, &cache, &statuses, false, tty));
     println!(
-        "Weekly limits | * current account | checked in {:.1}s",
+        "{} | checked in {:.1}s | timestamps are local",
+        if failed {
+            "Refresh completed with errors; STALE retains previous metrics"
+        } else {
+            "Refresh complete"
+        },
         start.elapsed().as_secs_f64()
     );
-    for (n, row) in table.iter().enumerate() {
-        for i in 0..5 {
-            print!(
-                "{:<width$}{}",
-                row[i],
-                if i == 4 { "" } else { "  " },
-                width = widths[i]
-            );
-        }
-        println!();
-        if n == 0 {
-            println!("{}", "-".repeat(widths.iter().sum::<usize>() + 8));
-        }
-    }
+    io::stdout().flush()?;
     if failed {
         return Err(err("some account checks failed"));
     }
@@ -488,12 +678,63 @@ pub fn report(app: &App, args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn cached_table_has_gauge_status_and_account_timestamp() {
+        let profile = Profile {
+            name: "alpha".into(),
+            paths: vec![],
+            bytes: vec![],
+            current: true,
+        };
+        let cache = Cache::from([(
+            "alpha".into(),
+            Cached {
+                updated_at: 1800000000,
+                windows: vec![Window {
+                    id: "codex".into(),
+                    used: 9.,
+                    reset: Some(1800010000),
+                }],
+            },
+        )]);
+        let refreshing = table(
+            std::slice::from_ref(&profile),
+            &cache,
+            &HashMap::new(),
+            true,
+            true,
+        );
+        assert!(
+            refreshing.contains("┌")
+                && refreshing.contains("REFRESHING")
+                && refreshing.contains("9%")
+                && refreshing.contains("[█████████░] 91%")
+                && refreshing.contains("LAST UPDATED")
+        );
+        let completed = table(
+            &[profile],
+            &cache,
+            &HashMap::from([("alpha".into(), "OK".into())]),
+            false,
+            false,
+        );
+        assert!(completed.contains("OK") && !completed.contains("REFRESHING"));
+        assert_eq!(
+            reset_in(
+                Some(1800000000 + 3 * 86400 + 14 * 3600 + 46 * 60),
+                1800000000
+            ),
+            "3d 14h 46m"
+        );
+        assert_eq!(reset_in(Some(0), 1), "due");
+        assert_eq!(reset_in(None, 1), "N/A");
+    }
+    #[test]
     fn weekly_windows_only_and_percent_clamping() {
         let v = json!({"rateLimits":{"primary":{"windowDurationMins":300,"usedPercent":1},"secondary":{"windowDurationMins":10080,"usedPercent":125,"resetsAt":0}}});
         let r = rows(&v);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0][1], "125.0%");
-        assert!(r[0][2].ends_with("0.0%"));
+        assert_eq!(r[0].used, 125.);
+        assert_eq!(percentage((100. - r[0].used).clamp(0., 100.)), "0%");
         assert!(rows(&json!({"rateLimits":{}})).is_empty());
     }
 }

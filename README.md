@@ -193,7 +193,13 @@ codex-appserver-ctl limits --watch
 Checks all saved accounts and the active account concurrently through isolated
 Codex app-servers. Displays weekly used/remaining percentages and reset times
 in the local timezone. `*` marks the active account. Terminal output shows an
-animated progress indicator until every account finishes. `--watch` enables
+animated progress indicator until every account finishes. The bordered table
+appears immediately with the previous quota metrics (or placeholders on first
+use), labeled REFRESHING, then is replaced when all checks complete. REMAINING
+uses a gauge, RESET IN shows a countdown, and LAST UPDATED records each account's
+last successful check. Failed refreshes retain previous metrics with STALE status
+and their original timestamps. A private 0600 `~/.codex/appserver-ctl-limits.json`
+cache stores quota metrics and timestamps only, without credentials. `--watch` enables
 keyboard refresh (`r`) and quit (`q`); redirected output remains a plain table.
 Identical credential files share one request. Managed token refreshes are saved
 only if the original files still match, without switching the active account or

@@ -138,7 +138,7 @@ for line in sys.stdin:
     let out = Command::new(env!("CARGO_BIN_EXE_codex-appserver-ctl"))
         .args(["limits", "--timeout", "1"])
         .env("HOME", home)
-        .env("CODEX_APPSERVER_HOST_CODEX", fake)
+        .env("CODEX_APPSERVER_HOST_CODEX", &fake)
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -148,14 +148,40 @@ for line in sys.stdin:
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("42.0%") && text.contains("58.0%") && text.contains("timed out"),
+        text.contains("42%") && text.contains("58%") && text.contains("timed out"),
         "{text}"
     );
-    assert!(!text.contains("\\x1b"));
+    assert!(!text.contains("\x1b"));
     let alpha: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join(".codex/accounts/alpha.json")).unwrap())
             .unwrap();
     assert_eq!(alpha["token"], "new");
+    let cache_path = home.join(".codex/appserver-ctl-limits.json");
+    let cached = fs::read(&cache_path).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&cached).unwrap();
+    assert_eq!(saved["alpha"]["windows"][0]["used"].as_f64(), Some(42.));
+    assert!(saved["alpha"]["updated_at"].as_i64().unwrap() > 0);
+    assert!(!String::from_utf8_lossy(&cached).contains("token"));
+    assert_eq!(
+        fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    executable(&fake, "#!/bin/sh\nexit 1\n");
+    let stale = Command::new(env!("CARGO_BIN_EXE_codex-appserver-ctl"))
+        .args(["limits", "--timeout", "1"])
+        .env("HOME", home)
+        .env("CODEX_APPSERVER_HOST_CODEX", &fake)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&stale.stdout);
+    assert!(!stale.status.success());
+    assert!(
+        text.contains("42%") && text.contains("STALE") && text.contains("LAST UPDATED"),
+        "{text}"
+    );
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(cache_path).unwrap()).unwrap();
+    assert_eq!(after["alpha"]["updated_at"], saved["alpha"]["updated_at"]);
+
     assert_eq!(
         fs::read_link(home.join(".codex/auth.json")).unwrap(),
         Path::new("accounts/alpha.json")
