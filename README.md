@@ -1,388 +1,249 @@
 # codex-appserver-ctl
 
-Use this command-line tool to manage Codex accounts and the app-server on macOS or Linux.
+Use this tool to manage Codex profiles and app-servers on macOS or Linux.
 Use `--target` to run a command on an SSH host.
+The tool is written in Rust. It does not require Python, Node.js, or ccusage.
 
 ## Requirements
 
-- Python 3.9 or later.
-- The Codex app or Codex CLI.
+- Codex CLI or the Codex desktop app.
 - OpenSSH for commands that use `--target`.
+- Cargo and Rust 1.85 or later, with a C linker, to build the tool.
+- Network access to download Rust packages during the first build.
 
-Linux requires a Codex CLI that supports `codex app-server daemon`.
-The tool uses Python standard libraries.
-You do not need to install Python packages.
+The compiled tool does not require Cargo at runtime.
+Linux server commands require a Codex CLI that supports `app-server daemon`.
 
-## Install the tool
+## Install
 
 From the repository directory, run:
 
 ```sh
 ./install.sh
-```
-
-The default installation path is `~/.local/bin/codex-appserver-ctl`.
-If necessary, add this line to your shell configuration:
-
-```sh
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-To select a different installation directory, run:
+The installer builds a release binary. It installs the binary at
+`~/.local/bin/codex-appserver-ctl`.
+To use a different directory or an existing compiled binary, run:
 
 ```sh
 ./install.sh --prefix "$HOME/tools"
+./install.sh --binary ./target/release/codex-appserver-ctl
 ```
 
-This command installs the tool in `~/tools/bin`.
-Add that directory to `PATH`.
+Run the installer again after a source change.
+The installer saves a different previous version as `codex-appserver-ctl.backup.*`.
+It refuses to replace a symlink, a non-regular file, or a file owned by another user.
 
-After you change the source, run `./install.sh` again.
-The installer replaces a different installed version.
-It first saves the previous version as `codex-appserver-ctl.backup.*` in the same directory.
-It does not make a backup if the file contents are equal.
+## Account profiles
 
-## Manage account profiles
-
-An account profile is a saved copy of Codex authentication data.
-Each host has its own profiles.
+Each host has its own profiles in `~/.codex/accounts/`.
+The tool uses `~/.codex` on the selected host.
 
 | Command | Function |
 | --- | --- |
-| `auth list` | Show saved profiles and the current account state. |
-| `auth current` | Show the current account state. |
+| `auth list` | Show saved profiles and current account state. |
+| `auth current` | Show current account state. |
+| `auth login NAME` | Log in and save a profile. Keep the current account. |
 | `auth save NAME` | Save current authentication data as a profile. |
-| `auth login NAME` | Log in and save a new profile. |
-| `auth use NAME` | Select a profile and restart the app-server. |
-| `auth use` | Show a profile selection menu. |
+| `save NAME` | Short form of `auth save NAME`. |
+| `auth use NAME` | Select a profile. Restart a running server. |
+| `auth use` | Select a profile from a terminal menu. |
 
-Use letters, digits, `.`, `_`, or `-` in profile names.
-Start the name with a letter or digit.
+Start profile names with a letter or digit. Use letters, digits, `.`, `_`, or `-`.
 Use a maximum of 128 characters.
 
 ```sh
-codex-appserver-ctl auth list
-codex-appserver-ctl auth current
-codex-appserver-ctl auth save personal
-codex-appserver-ctl auth use personal
-```
-
-You can also use `save NAME` as a short form of `auth save NAME`.
-
-```sh
-codex-appserver-ctl save personal
-codex-appserver-ctl save personal --target MY_SERVER
-```
-
-To use the selection menu, run `auth use` in a terminal.
-For scripts, specify the profile name.
-
-### Log in and save a profile
-
-Run:
-
-```sh
+codex-appserver-ctl auth login main --timeout 900
 codex-appserver-ctl auth login work --timeout 900
-```
-
-Complete the device login procedure that Codex shows.
-The tool logs in through a temporary `CODEX_HOME` directory.
-It uses file storage for authentication data.
-After a successful login, it saves the profile.
-It does not change the current account.
-If login fails or reaches the timeout, it does not add a profile.
-
-To select the new profile, run:
-
-```sh
+codex-appserver-ctl auth list
 codex-appserver-ctl auth use work
+codex-appserver-ctl save work
 ```
 
-The default timeout is 120 seconds.
-Use `--timeout 900` if you need more time.
-Use `--dry-run` to check the profile name and destination without login.
+Complete each device login in your browser with the required account.
+Login uses a temporary `CODEX_HOME` and file storage for credentials.
+A failed login does not add a profile.
 
-To replace an existing profile, add `--force`.
-The tool refuses to replace a profile that the current authentication file links to.
-Use a different profile name in that condition.
+Profile files contain credentials. The tool requires owned regular files with
+mode `0600`. It rejects symlinks and hard links in the profile directory.
+Do not add profile files to Git.
 
-You can also log in with Codex directly.
-Then run `auth save NAME` to save the current authentication data.
+Use `--force` to replace an existing inactive profile.
+The tool refuses to overwrite the active linked profile.
+Saving equal data to an existing profile succeeds without `--force`.
 
-### Check or change a profile
+Profile selection changes `auth.json` to a link to the selected profile.
+The tool locks profile changes. It restores the previous authentication link
+and current-account marker if an immediate restart fails.
+If no server is running, selection succeeds without a restart.
+To select a profile without a restart, run:
 
 ```sh
-codex-appserver-ctl auth use personal --dry-run
-codex-appserver-ctl auth use personal --restart=false
-codex-appserver-ctl auth save personal --force
+codex-appserver-ctl auth use work --no-restart
+codex-appserver-ctl auth use work --dry-run
 ```
 
-`auth use --dry-run` checks the profile and restart target without a change.
-If no app-server is running, `auth use` changes the profile without a restart.
-It shows `auth_restart result=skipped reason=no-running-app-server`.
-The next app-server start uses the selected profile.
-`--restart=false` changes authentication data without a restart.
-An app-server that continues to run can keep the previous authentication data.
-`auth save --force` replaces an existing saved profile.
-
-The tool locks account changes and replaces authentication files as one operation.
-If the restart fails, the tool restores the previous authentication files.
-A command inside the app-server can schedule the restart in a separate process.
-For a scheduled command, read the log path in the command output.
-Check that log for the result.
-
-## Select an SSH host
-
-Use `--target` with an SSH alias or `user@host`.
-Replace `MY_SERVER` in the examples with your SSH alias.
-Without `--target`, the tool runs on the current host.
-The tool uses normal SSH configuration, key authentication, and host verification.
-
-```sh
-codex-appserver-ctl auth list --target MY_SERVER
-codex-appserver-ctl auth use work --target MY_SERVER
-codex-appserver-ctl auth use --target MY_SERVER
-codex-appserver-ctl status --target user@host
-codex-appserver-ctl auth use work --target=MY_SERVER --dry-run
-```
-
-The tool first checks `PATH` and `~/.local/bin` on the remote host.
-If the tool is missing, it asks for permission to install.
-If the remote version does not support the requested command, it asks for permission to update.
-
-```text
-Install this local version on MY_SERVER at ~/.local/bin/codex-appserver-ctl?
-Install/update? [y/N]
-```
-
-Enter `y` or `yes` to permit installation and execution of the original command.
-Any other answer stops the command without changes.
-Without an interactive terminal, the tool stops without installation.
-With `--dry-run`, the tool reports the missing installation without changes.
-
-Installation copies the local script through SSH.
-It does not download a version from GitHub or install Codex.
-The remote host requires Python 3.9 or later.
-The destination is `~/.local/bin/codex-appserver-ctl`.
-The installer saves an existing file as `codex-appserver-ctl.backup.*` before replacement.
-It refuses to replace a symbolic link or a file owned by another user.
-After installation, the command uses the installed file directly.
-This prevents an older version in `PATH` from taking priority for that command.
-If installation fails, the original command does not run.
-
-The command uses profiles on the remote host.
-It does not send local authentication files to that host.
-The command controls Codex for the SSH user.
-It does not select a STAMCord deployment.
-
-For older remote scripts, the tool reads the help text to select the previous `home` command format.
-New commands require the current version on the remote host.
-
-### Show SSH aliases
-
-Run:
-
-```sh
-codex-appserver-ctl targets
-```
-
-The tool reads user and system SSH configuration files.
-It also reads files specified by `Include`.
-It shows explicit aliases in sorted order.
-It excludes wildcard and negative patterns.
-It does not test connections or evaluate `Host` and `Match` conditions.
-It does not run `Match exec` commands.
-
-### Install or update on a remote host
-
-Connect to the remote host with SSH.
-Then run:
-
-```sh
-git clone https://github.com/ancom21c/codex-appserver-ctl.git
-cd codex-appserver-ctl
-./install.sh
-```
-
-On that host, omit `--target` to manage its local Codex.
-
-```sh
-codex-appserver-ctl auth use work
-codex-appserver-ctl restart
-```
-
-To update an existing installation, run these commands in its repository directory:
-
-```sh
-git pull --ff-only
-./install.sh
-```
-
-An SSH command asks to update only if the requested command requires an update.
-It does not check GitHub for newer versions.
-For other source changes, update the remote installation with the commands above.
-
-## Control the app-server
-
-| Command | Function |
-| --- | --- |
-| `status` | Show the app-server state. |
-| `start` | Start the managed daemon. |
-| `restart` | Restart the app-server. |
-| `stop` | Stop the app-server. |
+## Server commands
 
 ```sh
 codex-appserver-ctl status
 codex-appserver-ctl start
 codex-appserver-ctl restart
 codex-appserver-ctl stop
-codex-appserver-ctl restart --dry-run
-codex-appserver-ctl restart --target MY_SERVER
 ```
 
-The previous `true` command means restart.
-The previous `false` command means stop.
+The tool uses the Codex daemon commands for a managed server.
+On macOS, it can stop and reopen an app-hosted server in ChatGPT or Codex.
+An unmanaged server requires its own launcher to restart.
+Use `--force` to permit SIGKILL if a graceful stop fails.
 
-On Linux, the tool uses official daemon commands.
-On macOS, restart and stop use the official daemon first.
-For an app-hosted server, the tool stops the related app.
-For a restart, it opens that app again.
-The tool recognizes the current Codex CLI bundle inside the ChatGPT and Codex apps.
-It refuses to restart an unmanaged standalone server before it stops that server.
-The `start` command starts a managed daemon, not the desktop app.
+A command that must restart its own parent server runs in a detached process.
+The initial result confirms scheduling. It does not confirm completion.
+Read the detached log to check the result:
 
-Use `--timeout N` to set the command and lock timeout.
-The default is 120 seconds.
-The permitted range is 1 to 900 seconds.
-SSH connection timeouts use SSH configuration.
+```sh
+codex-appserver-ctl logs
+```
 
-Use `--force` to permit forced termination if normal app-server termination fails.
-The output field `target=home` identifies local Codex on the host that executes the command.
+## Update Codex CLI
 
-## Manage Remote Control
+```sh
+codex-appserver-ctl update --timeout 900
+codex-appserver-ctl update --no-restart --timeout 900
+codex-appserver-ctl update --dry-run
+```
 
-SSH selects the host that executes a command.
-Codex Remote Control manages remote access to the daemon on that host.
-These commands require a Codex CLI that supports the specified functions.
+The tool downloads and runs the [official Codex installer](https://chatgpt.com/codex/install.sh).
+It selects the latest stable release and installs at `~/.local/bin/codex`.
+It verifies the installed CLI version. It then restarts a running server.
+A download, install, or version-check failure does not trigger a restart.
+An install can succeed while a restart fails. The error states this result.
 
-| Command after `remote-control` | Function |
-| --- | --- |
-| `start` | Enable Remote Control and start the daemon. |
-| `pair` | Show a manual pairing code that expires after a short time. |
-| `enable` | Enable Remote Control for the current daemon and future starts. |
-| `disable` | Disable Remote Control. |
-| `status` | Show official daemon version and state data as JSON. |
-| `stop` | Stop the daemon. |
-| `bootstrap` | Set up a managed daemon with Remote Control enabled. |
+Put `~/.local/bin` first in `PATH` to use the installed CLI in your shell.
+This command updates the CLI. It does not update the desktop app or this tool.
+On macOS, an app-hosted server restarts with the app's bundled executable.
+Use `--no-restart` to install the CLI without restarting a server.
+
+## Usage reports
+
+```sh
+codex-appserver-ctl usage
+codex-appserver-ctl usage daily --last 7
+codex-appserver-ctl usage monthly
+codex-appserver-ctl usage session --json
+codex-appserver-ctl usage --since 2026-10-01 --until 2026-10-06
+```
+
+The tool reads JSONL files from `~/.codex/sessions` and
+`~/.codex/archived_sessions`. It groups token counts by model and day, month,
+or session. It does not call ccusage or download prices.
+
+Dates use the selected host's local timezone. Date limits include both dates.
+`--last N` means N calendar days, including today, in every report mode.
+The JSON report includes input, cached input, cache write, output, reasoning,
+and total token counts. The table shows input, cached input, output, and total.
+
+The reader converts cumulative token counts to increments.
+It ignores repeated cumulative records and duplicate active/archive paths.
+It handles counter resets and records that contain only the latest increment.
+Reasoning tokens are part of output tokens. Do not add them to the total again.
+Malformed JSON lines are skipped and counted.
+
+Reports show recorded usage on this host. They do not show remaining account
+limits, subscription charges, or usage that is absent from these files.
+Reports can include multiple accounts used on the same host. They do not assign
+sessions to authentication profiles.
+
+### Cost estimates
+
+Supply prices in USD per million tokens with `--prices FILE`.
+Use each model name exactly as recorded in the logs.
+For example, a `prices.json` file can contain these illustrative values:
+
+```json
+{
+  "EXAMPLE_MODEL": { "input": 2.0, "cached": 0.2, "output": 8.0 }
+}
+```
+
+```sh
+codex-appserver-ctl usage monthly --prices ./prices.json
+```
+
+Replace the example values with the applicable rates.
+The estimate uses uncached input, cached input, and output counts.
+An unknown model price produces `-` in the table and `null` in JSON.
+An estimate is not a billed charge.
+
+## SSH targets
+
+Omit `--target` to run on the current host.
+Use an SSH alias or hostname as the target. SSH uses your normal configuration.
+
+```sh
+codex-appserver-ctl targets
+codex-appserver-ctl status --target MY_SERVER
+codex-appserver-ctl auth login work --target MY_SERVER --timeout 900
+codex-appserver-ctl auth use work --target MY_SERVER
+codex-appserver-ctl update --target MY_SERVER --timeout 900
+codex-appserver-ctl usage daily --last 7 --target MY_SERVER
+```
+
+Remote login saves credentials on the remote host. It does not copy local
+credentials to that host. Usage reads the remote host's session files.
+A price file path refers to a file on the selected host.
+
+The tool checks the remote command before execution.
+If the tool is missing or the requested command is unavailable, it asks to
+install this Rust version. Installation requires your confirmation in a terminal.
+In a non-interactive session or a dry run, it reports the requirement and stops.
+
+After confirmation, it sends the embedded source over SSH, builds on the target,
+and installs at `~/.local/bin/codex-appserver-ctl`. It then runs the requested command.
+The target requires Cargo, Rust 1.85 or later, a C linker, tar, and network access.
+The tool does not install Rust or system packages for you.
+
+## Remote control
 
 ```sh
 codex-appserver-ctl remote-control start
 codex-appserver-ctl remote-control pair
+codex-appserver-ctl remote-control stop
 codex-appserver-ctl remote-control enable
 codex-appserver-ctl remote-control disable
 codex-appserver-ctl remote-control status
-codex-appserver-ctl remote-control stop
-codex-appserver-ctl remote-control start --target MY_SERVER
-codex-appserver-ctl remote-control pair --target MY_SERVER
-codex-appserver-ctl remote-control bootstrap --target MY_SERVER
+codex-appserver-ctl remote-control bootstrap
 ```
 
-The `status` command shows `codex app-server daemon version` output.
-It does not calculate Remote Control connection state.
-The `pair` command shows the code in the terminal.
-If the CLI does not support a command, the tool shows the CLI error.
+`start`, `stop`, and `pair` use `codex remote-control`.
+`enable` and `disable` change daemon remote-control settings.
+`status` shows daemon state. `bootstrap` sets up a daemon with remote control.
+Add `--target MY_SERVER` for a remote host.
 
-The `bootstrap` command runs `codex app-server daemon bootstrap --remote-control`.
-This command can change user service configuration.
-To show the command without execution, run:
-
-```sh
-codex-appserver-ctl remote-control bootstrap --dry-run
-```
-
-## Check the installation
-
-Run:
+## Diagnostics and logs
 
 ```sh
 codex-appserver-ctl doctor
-codex-appserver-ctl doctor --target MY_SERVER
+codex-appserver-ctl logs --lines 200
+codex-appserver-ctl logs --follow
+codex-appserver-ctl logs --file "$HOME/.codex/log/codex-app-server.log"
+codex-appserver-ctl logs --unit YOUR_USER_SERVICE
 ```
 
-The `doctor` command checks these items:
+`doctor` checks CLI availability, authentication, profiles, and command support.
+`logs` selects the latest matching local log unless you specify a file or unit.
+`--unit` uses the user journal on Linux.
 
-- CLI path and version.
-- Authentication file owner and permissions.
-- Profile file validity.
-- Managed daemon state.
-- Support for daemon, Remote Control, bootstrap, and device login commands.
-
-It does not show authentication file contents.
-A `FAIL` result gives exit code 1.
-Missing authentication or an unavailable daemon gives a `WARN` result.
-On macOS, the desktop app can use an app-server instead of a managed daemon.
-
-## Read logs
+## Development
 
 ```sh
-codex-appserver-ctl logs
-codex-appserver-ctl logs --follow --target MY_SERVER
-codex-appserver-ctl logs --file /path/to/daemon.log --lines 200
-codex-appserver-ctl logs --unit YOUR_USER_SERVICE --follow --target MY_SERVER
-```
-
-The default command shows the last 100 lines of the most recent applicable log.
-It checks scheduled operation logs in `~/.codex`.
-It also checks daemon and app-server `.log` files in these directories:
-
-- `~/.codex/log`.
-- `~/.codex/logs`.
-- `~/.codex/app-server-control`.
-
-Use `--follow` to continue to read the selected file.
-If the tool finds no log, specify its path with `--file`.
-For a Linux user service journal, specify the actual service name with `--unit`.
-The tool then uses `journalctl --user`.
-The tool does not infer service names or other log paths.
-
-## Data files
-
-The tool uses `~/.codex` on the host that executes the command.
-It does not use `CODEX_HOME` to select a different data directory.
-
-| Path | Contents |
-| --- | --- |
-| `~/.codex/auth.json` | Current authentication data. |
-| `~/.codex/accounts/*.json` | Saved profiles with file permissions `0600`. |
-| `~/.codex/current` | Current profile name. |
-| `~/.codex/appserver-ctl-auth.lock` | Account change lock. |
-
-Do not add authentication files to this repository.
-
-## Remove the tool
-
-Delete `bin/codex-appserver-ctl` from the installation directory.
-This procedure leaves authentication data and saved profiles in place.
-
-## Change and check the source
-
-Change the source in `bin/codex-appserver-ctl`.
-Change installation procedures in `install.sh`.
-
-To check a change, run:
-
-```sh
-python3 -m unittest discover -s tests -v
-sh -n install.sh
-git diff --check
-```
-
-To install the change, run:
-
-```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 ./install.sh
-codex-appserver-ctl --help
 ```
 
-Tests use temporary installation directories and simulated remote commands.
-Tests do not make SSH connections, change real accounts, or restart real apps.
+Tests use temporary profiles, synthetic session records, and fake installers.
+They do not log in, download a Codex release, or restart a live server.
