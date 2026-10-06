@@ -20,7 +20,7 @@ fn err(message: impl Into<String>) -> Box<dyn Error> {
     message.into().into()
 }
 const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
-const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start|stop|pair|enable|disable|status|bootstrap\n  update [--no-restart] [--timeout N] [--dry-run]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Rust builds on the target require Cargo.\nUsage reads local history. It does not query remaining account limits.\n";
+const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start|stop|pair|enable|disable|status|bootstrap\n  update [--no-restart] [--timeout N] [--dry-run]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  --version\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Remote binary installation requires curl, tar, and a SHA-256 tool.\nUsage reads local history. It does not query remaining account limits.\n";
 struct App {
     home: PathBuf,
     data: PathBuf,
@@ -959,7 +959,7 @@ fn remote(host: &str, args: &[String]) -> Result<()> {
                 "remote installation requires confirmation in an interactive terminal",
             ));
         }
-        eprintln!("Build and install this Rust version on {host} at ~/.local/bin/codex-appserver-ctl?\nRequires Cargo, a C linker, tar, and network access on the target. Existing file will be backed up.\nAfter installation the requested command will run.");
+        eprintln!("Download and install version {} on {host} at ~/.local/bin/codex-appserver-ctl?\nRequires curl, tar, a SHA-256 tool, and network access on the target. Existing file will be backed up.\nAfter installation the requested command will run.", env!("CARGO_PKG_VERSION"));
         if !matches!(
             prompt("Install/update? [y/N] ")?.to_lowercase().as_str(),
             "y" | "yes"
@@ -1004,50 +1004,18 @@ fn remote(host: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 fn install_remote(host: &str) -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    fs::create_dir(temp.path().join("src"))?;
-    for (p, data) in [
-        ("Cargo.toml", include_str!("../Cargo.toml")),
-        ("Cargo.lock", include_str!("../Cargo.lock")),
-        ("src/main.rs", include_str!("main.rs")),
-        ("src/usage.rs", include_str!("usage.rs")),
-    ] {
-        fs::write(temp.path().join(p), data)?;
-    }
-    let archive = temp.path().join("source.tar");
-    run(
-        Command::new("tar")
-            .arg("-cf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(temp.path())
-            .args(["Cargo.toml", "Cargo.lock", "src"]),
-        30,
-    )?;
-    let shell = r#"set -eu
-export PATH="$HOME/.cargo/bin:$PATH"
-command -v cargo >/dev/null || { echo 'Cargo is required on the target' >&2; exit 1; }
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-tar -xf - -C "$tmp"
-cd "$tmp"
-cargo build --release --locked
-mkdir -p "$HOME/.local/bin"
-dest="$HOME/.local/bin/codex-appserver-ctl"
-if [ -L "$dest" ] || { [ -e "$dest" ] && [ ! -f "$dest" ]; }; then echo 'Refusing unsafe destination' >&2; exit 1; fi
-if [ -f "$dest" ] && [ -z "$(find "$dest" -user "$(id -un)" -print)" ]; then echo "Refusing foreign-owned destination" >&2; exit 1; fi
-if [ -f "$dest" ]; then backup=$(mktemp "$HOME/.local/bin/codex-appserver-ctl.backup.XXXXXX"); cp -p "$dest" "$backup"; echo "Previous version: $backup"; fi
-copy=$(mktemp "$HOME/.local/bin/.codex-appserver-ctl.XXXXXX")
-cp target/release/codex-appserver-ctl "$copy"
-chmod 755 "$copy"
-mv -f "$copy" "$dest"
-echo "Installed: $dest"
-"#;
-    let input = File::open(archive)?;
+    let mut script = tempfile::tempfile()?;
+    script.write_all(include_bytes!("../install.sh"))?;
+    script.seek(SeekFrom::Start(0))?;
     run(
         Command::new("ssh")
-            .args(["-T", "--", host, shell])
-            .stdin(input),
+            .args([
+                "-T",
+                "--",
+                host,
+                &format!("sh -s -- --version {}", quote(env!("CARGO_PKG_VERSION"))),
+            ])
+            .stdin(script),
         900,
     )
 }
@@ -1248,6 +1216,13 @@ fn logs(app: &App, args: &[String]) -> Result<()> {
 }
 fn dispatch(app: &mut App, args: &[String]) -> Result<()> {
     let (host, mut args) = target(args)?;
+    if args == ["--version"] || args == ["-V"] {
+        if let Some(host) = host {
+            return remote(&host, &args);
+        }
+        println!("codex-appserver-ctl {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if args.first().is_some_and(|s| s == "save") {
         args.insert(0, "auth".into());
     }

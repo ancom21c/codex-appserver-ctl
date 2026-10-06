@@ -1,0 +1,76 @@
+name: Release binaries
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add '${{ matrix.target }}'
+      - name: Set up musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check and build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked --target "$RELEASE_TARGET"
+          cargo build --release --locked --target "$RELEASE_TARGET"
+          target/$RELEASE_TARGET/release/codex-appserver-ctl --version
+          mkdir -p dist
+          asset="codex-appserver-ctl-$RELEASE_TARGET.tar.gz"
+          tar -czf "dist/$asset" -C "target/$RELEASE_TARGET/release" codex-appserver-ctl
+          (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
+          sh install.sh --binary "target/$RELEASE_TARGET/release/codex-appserver-ctl" --prefix "$RUNNER_TEMP/ctl-smoke"
+          "$RUNNER_TEMP/ctl-smoke/bin/codex-appserver-ctl" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp install.sh dist/install.sh
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

@@ -6,35 +6,97 @@ The tool is written in Rust. It does not require Python, Node.js, or ccusage.
 
 ## Requirements
 
-- Codex CLI or the Codex desktop app.
+For a release binary, use:
+
+- macOS or Linux on ARM64 or x86_64.
+- `curl`, `tar`, and `sha256sum` or `shasum` to install the tool.
+- HTTPS access to GitHub Releases and its download hosts.
+- Codex CLI or the Codex desktop app for account and server commands.
 - OpenSSH for commands that use `--target`.
-- Cargo and Rust 1.85 or later, with a C linker, to build the tool.
-- Network access to download Rust packages during the first build.
 
-The compiled tool does not require Cargo at runtime.
+Rust, Cargo, and a C linker are not required to install or run a release binary.
 Linux server commands require a Codex CLI that supports `app-server daemon`.
+Linux release binaries use musl. They do not require a specific glibc version.
 
-## Install
+## Install a release binary
 
-From the repository directory, run:
+Download the installer from the latest release. Then run it:
 
 ```sh
-./install.sh
+curl -fsSL https://github.com/ancom21c/codex-appserver-ctl/releases/latest/download/install.sh -o /tmp/codex-appserver-ctl-install.sh
+sh /tmp/codex-appserver-ctl-install.sh
 export PATH="$HOME/.local/bin:$PATH"
+codex-appserver-ctl --version
 ```
 
-The installer builds a release binary. It installs the binary at
-`~/.local/bin/codex-appserver-ctl`.
-To use a different directory or an existing compiled binary, run:
+The installer selects the archive for your OS and CPU.
+It checks the SHA-256 digest before extraction.
+It installs the binary at `~/.local/bin/codex-appserver-ctl`.
+
+To select a version or installation directory, run:
 
 ```sh
-./install.sh --prefix "$HOME/tools"
+sh /tmp/codex-appserver-ctl-install.sh --version 0.3.0
+sh /tmp/codex-appserver-ctl-install.sh --prefix "$HOME/tools"
+```
+
+From a repository checkout, `./install.sh` also downloads the latest release.
+Use `--source` to build the checked-out source instead.
+To install an existing compiled binary, run:
+
+```sh
 ./install.sh --binary ./target/release/codex-appserver-ctl
 ```
 
-Run the installer again after a source change.
 The installer saves a different previous version as `codex-appserver-ctl.backup.*`.
 It refuses to replace a symlink, a non-regular file, or a file owned by another user.
+A download or digest-check failure leaves the installed version unchanged.
+It does not start a source build automatically.
+
+## Build from source
+
+A source build requires Cargo, Rust 1.85 or later, a C compiler and linker,
+and network access to download Rust packages.
+Install the OS build tools first.
+
+On macOS, run:
+
+```sh
+xcode-select --install
+```
+
+On Debian or Ubuntu, run:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential curl ca-certificates
+```
+
+On Fedora, run:
+
+```sh
+sudo dnf install gcc gcc-c++ make curl ca-certificates
+```
+
+Install Rust and Cargo with the [official Rust installer](https://rust-lang.org/tools/install/):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+sh /tmp/rustup-init.sh
+. "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
+
+If Rust is already installed with rustup, use `rustup update stable` to update it.
+From the repository directory, run:
+
+```sh
+./install.sh --source
+```
+
+The build uses `Cargo.lock`. Rust packages are required at build time.
+They do not add a Python, Node.js, or ccusage runtime requirement.
 
 ## Account profiles
 
@@ -200,10 +262,15 @@ If the tool is missing or the requested command is unavailable, it asks to
 install this Rust version. Installation requires your confirmation in a terminal.
 In a non-interactive session or a dry run, it reports the requirement and stops.
 
-After confirmation, it sends the embedded source over SSH, builds on the target,
-and installs at `~/.local/bin/codex-appserver-ctl`. It then runs the requested command.
-The target requires Cargo, Rust 1.85 or later, a C linker, tar, and network access.
-The tool does not install Rust or system packages for you.
+After confirmation, it sends the embedded installer over SSH.
+The target downloads the release that matches the local tool version.
+It verifies the archive digest and installs at `~/.local/bin/codex-appserver-ctl`.
+It then runs the requested command.
+
+The target requires curl, tar, a SHA-256 tool, and HTTPS access to GitHub Releases.
+Cargo and Rust are not required. The tool does not install system packages.
+If the target cannot download the release, installation stops.
+To build there instead, check out the repository and run `./install.sh --source`.
 
 ## Remote control
 
@@ -242,8 +309,25 @@ codex-appserver-ctl logs --unit YOUR_USER_SERVICE
 cargo fmt --check
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
-./install.sh
+./install.sh --source
 ```
 
 Tests use temporary profiles, synthetic session records, and fake installers.
 They do not log in, download a Codex release, or restart a live server.
+
+## Publish a release
+
+The release workflow builds and tests four targets: macOS ARM64, macOS x86_64,
+Linux ARM64 musl, and Linux x86_64 musl.
+It publishes archives, SHA-256 files, and `install.sh` to GitHub Releases.
+
+Set the package version in `Cargo.toml` and update `Cargo.lock`.
+Commit the changes. Then push a matching version tag:
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+The tag must match the package version. All four builds must pass before publication.
+A manual workflow run builds and tests the binaries without publishing a release.
