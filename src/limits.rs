@@ -1,4 +1,5 @@
 use crate::{atomic, err, options, App, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,6 +40,7 @@ impl Drop for Server {
 #[derive(Clone)]
 struct Profile {
     name: String,
+    key: String,
     paths: Vec<PathBuf>,
     bytes: Vec<u8>,
     current: bool,
@@ -52,6 +54,9 @@ fn request(
     params: Value,
     deadline: Instant,
 ) -> std::result::Result<Value, String> {
+    if CANCEL.load(Ordering::Relaxed) {
+        return Err("cancelled".into());
+    }
     writeln!(
         server.0.stdin.as_mut().unwrap(),
         "{}",
@@ -110,6 +115,8 @@ fn request(
 fn check(app: &App, profile: &Profile, timeout: u64) -> std::result::Result<Value, String> {
     let deadline = Instant::now() + Duration::from_secs(timeout);
     let temp = tempfile::tempdir().map_err(|_| "temporary directory failed".to_string())?;
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .map_err(|_| "temporary directory permissions failed".to_string())?;
     let auth = temp.path().join("auth.json");
     fs::write(&auth, &profile.bytes).map_err(|_| "auth copy failed".to_string())?;
     fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))
@@ -139,63 +146,105 @@ fn check(app: &App, profile: &Profile, timeout: u64) -> std::result::Result<Valu
             .map_err(|_| "server start failed".to_string())?,
     );
     let mut buffer = Vec::new();
-    request(
-        &mut server,
-        &mut buffer,
-        1,
-        "initialize",
-        json!({"clientInfo":{"name":"codex-appserver-ctl","version":env!("CARGO_PKG_VERSION")}}),
-        deadline,
-    )?;
-    writeln!(
-        server.0.stdin.as_mut().unwrap(),
-        "{}",
-        json!({"method":"initialized"})
-    )
-    .map_err(|_| "server disconnected".to_string())?;
-    request(
-        &mut server,
-        &mut buffer,
-        2,
-        "account/read",
-        json!({"refreshToken":false}),
-        deadline,
-    )?;
-    let result = request(
-        &mut server,
-        &mut buffer,
-        3,
-        "account/rateLimits/read",
-        json!({}),
-        deadline,
-    );
+    let result = (|| {
+        request(
+            &mut server,
+            &mut buffer,
+            1,
+            "initialize",
+            json!({"clientInfo":{"name":"codex-appserver-ctl","version":env!("CARGO_PKG_VERSION")}}),
+            deadline,
+        )?;
+        writeln!(
+            server.0.stdin.as_mut().unwrap(),
+            "{}",
+            json!({"method":"initialized"})
+        )
+        .map_err(|_| "server disconnected".to_string())?;
+        request(
+            &mut server,
+            &mut buffer,
+            2,
+            "account/read",
+            json!({"refreshToken":false}),
+            deadline,
+        )?;
+        request(
+            &mut server,
+            &mut buffer,
+            3,
+            "account/rateLimits/read",
+            json!({}),
+            deadline,
+        )
+    })();
     drop(server);
     // Persist managed token rotation only if the original files still match the snapshot.
-    if app.secure(&auth) {
-        let refreshed = fs::read(&auth).map_err(|_| "auth read failed".to_string())?;
-        if refreshed != profile.bytes && !CANCEL.load(Ordering::Relaxed) {
+    if !app.secure(&auth) {
+        let recovery = temp.keep().join("auth.json");
+        return Err(format!(
+            "auth became unreadable or unsafe; auth preserved at {}",
+            recovery.display()
+        ));
+    }
+    let refreshed = match fs::read(&auth) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let recovery = temp.keep().join("auth.json");
+            return Err(format!(
+                "auth read failed; auth preserved at {}",
+                recovery.display()
+            ));
+        }
+    };
+    if refreshed != profile.bytes {
+        let saved = (|| -> Result<()> {
+            if identity(&profile.bytes).is_some()
+                && identity(&profile.bytes) != identity(&refreshed)
+            {
+                return Err(err("refreshed auth belongs to a different account"));
+            }
             let _lock = app
-                .lock(
+                .lock_with_cancel(
                     deadline
                         .saturating_duration_since(Instant::now())
                         .as_secs()
                         .saturating_add(1),
+                    || CANCEL.load(Ordering::Relaxed),
                 )
-                .map_err(|_| "token save lock timed out".to_string())?;
+                .or_else(|e| {
+                    if CANCEL.load(Ordering::Relaxed) {
+                        app.lock(0)
+                    } else {
+                        Err(e)
+                    }
+                })?;
             for path in &profile.paths {
                 if !app.secure(path) || !fs::read(path).is_ok_and(|b| b == profile.bytes) {
-                    return Err("auth changed during check; retry".into());
+                    return Err(err("auth changed during check; retry"));
                 }
             }
             for path in &profile.paths {
-                atomic(path, &refreshed).map_err(|_| "token save failed".to_string())?;
+                atomic(path, &refreshed)?;
             }
+            Ok(())
+        })();
+        if let Err(e) = saved {
+            let recovery = temp.keep().join("auth.json");
+            return Err(format!(
+                "token save failed ({e}); refreshed auth preserved at {}",
+                recovery.display()
+            ));
         }
     }
     result
 }
 fn clean(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).take(80).collect()
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(80)
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Window {
@@ -203,8 +252,56 @@ struct Window {
     used: f64,
     reset: Option<i64>,
 }
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Identity {
+    user: String,
+    account: String,
+}
+fn identity(bytes: &[u8]) -> Option<Identity> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let tokens = value.get("tokens")?;
+    let jwt = tokens.get("id_token")?.as_str()?;
+    let parts: Vec<_> = jwt.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let payload = URL_SAFE_NO_PAD.decode(parts[1]).ok()?;
+    let claims: Value = serde_json::from_slice(&payload).ok()?;
+    let auth = claims.get("https://api.openai.com/auth")?;
+    let user = auth
+        .get("chatgpt_user_id")
+        .and_then(Value::as_str)
+        .or_else(|| auth.get("user_id").and_then(Value::as_str))
+        .or_else(|| claims.get("sub").and_then(Value::as_str))?;
+    let account = tokens
+        .get("account_id")
+        .and_then(Value::as_str)
+        .or_else(|| auth.get("chatgpt_account_id").and_then(Value::as_str))?;
+    if user.is_empty() || account.is_empty() || user.len() > 256 || account.len() > 256 {
+        return None;
+    }
+    Some(Identity {
+        user: user.into(),
+        account: account.into(),
+    })
+}
+fn same_account(app: &App, profile: &Profile) -> bool {
+    let expected = identity(&profile.bytes);
+    profile.paths.iter().all(|path| {
+        app.secure(path)
+            && fs::read(path).is_ok_and(|bytes| {
+                if expected.is_some() {
+                    identity(&bytes) == expected
+                } else {
+                    bytes == profile.bytes
+                }
+            })
+    })
+}
 #[derive(Clone, Serialize, Deserialize)]
 struct Cached {
+    #[serde(default)]
+    identity: Option<Identity>,
     updated_at: i64,
     windows: Vec<Window>,
 }
@@ -257,7 +354,9 @@ fn load_cache(app: &App) -> Cache {
         .unwrap_or_default()
 }
 fn percentage(n: f64) -> String {
-    if n.fract() == 0. {
+    if n >= 10000. {
+        format!("{n:.1e}%")
+    } else if n.fract() == 0. {
         format!("{n:.0}%")
     } else {
         format!("{n:.1}%")
@@ -303,6 +402,7 @@ fn table(
     statuses: &HashMap<String, String>,
     refreshing: bool,
     unicode: bool,
+    columns: usize,
 ) -> String {
     let now = Local::now().timestamp();
     let mut table: Vec<Vec<String>> = vec![[
@@ -320,11 +420,11 @@ fn table(
     .map(String::from)
     .collect()];
     for p in profiles {
-        let cached = cache.get(&p.name);
+        let cached = cache.get(&p.key);
         let status = if refreshing {
             "REFRESHING"
         } else {
-            statuses.get(&p.name).map(String::as_str).unwrap_or("N/A")
+            statuses.get(&p.key).map(String::as_str).unwrap_or("N/A")
         };
         let updated = cached
             .and_then(|c| Local.timestamp_opt(c.updated_at, 0).single())
@@ -368,9 +468,38 @@ fn table(
             }
         }
     }
-    let widths: Vec<_> = (0..9)
-        .map(|i| table.iter().map(|r| r[i].chars().count()).max().unwrap())
-        .collect();
+    let full_table = table;
+    let widths_for = |rows: &[Vec<String>]| -> Vec<usize> {
+        (0..rows[0].len())
+            .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap())
+            .collect()
+    };
+    let full_width = widths_for(&full_table).iter().sum::<usize>() + 3 * 9 + 1;
+    let compact = full_width > columns;
+    let mut table = full_table.clone();
+    if compact {
+        let selection = if columns >= 75 {
+            vec![0, 1, 3, 4, 7]
+        } else if columns >= 60 {
+            vec![0, 3, 4, 7]
+        } else {
+            vec![0, 3]
+        };
+        table = full_table
+            .iter()
+            .map(|r| selection.iter().map(|i| r[*i].clone()).collect())
+            .collect();
+        // All omitted columns remain available below, including full profile names.
+        let widths = widths_for(&table);
+        let other = widths.iter().skip(1).sum::<usize>() + 3 * widths.len() + 1;
+        let limit = columns.saturating_sub(other).max(7);
+        for r in &mut table {
+            if r[0].chars().count() > limit {
+                r[0] = format!("{}…", r[0].chars().take(limit - 1).collect::<String>());
+            }
+        }
+    }
+    let widths = widths_for(&table);
     let mut output = String::new();
     let borders = if unicode {
         ["┌", "┬", "┐", "├", "┼", "┤", "└", "┴", "┘", "─", "│"]
@@ -405,16 +534,51 @@ fn table(
         }
     }
     output.push_str(&border(borders[6], borders[7], borders[8]));
+    if compact {
+        for row in full_table.iter().skip(1) {
+            for line in [
+                format!(
+                    "{}{} / {}: {} remaining, {}",
+                    if row[1] == "*" { "* " } else { "" },
+                    row[0],
+                    row[2],
+                    row[4],
+                    row[7]
+                ),
+                format!("Reset: {} ({}) | Last updated: {}", row[5], row[6], row[8]),
+            ] {
+                let chars: Vec<_> = line.chars().collect();
+                for chunk in chars.chunks(columns.max(1)) {
+                    output.extend(chunk);
+                    output.push('\n');
+                }
+            }
+        }
+    }
     output
 }
-fn terminal_columns() -> usize {
+fn terminal_size() -> (usize, usize) {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
-        && size.ws_col > 0
-    {
-        size.ws_col as usize
+    let fd = if io::stdout().is_terminal() {
+        libc::STDOUT_FILENO
     } else {
-        80
+        libc::STDERR_FILENO
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0
+        && size.ws_col > 0
+        && size.ws_row > 0
+    {
+        (size.ws_col as usize, size.ws_row as usize)
+    } else {
+        (80, 24)
+    }
+}
+fn redraw(lines: usize, size: (usize, usize)) {
+    // Only replace a frame still fully visible at the same terminal dimensions.
+    if lines > 0 && lines + 1 < size.1 && size == terminal_size() {
+        print!("\x1b[{lines}A\r\x1b[J");
+    } else {
+        println!();
     }
 }
 fn report_once(app: &App, args: &[String]) -> Result<()> {
@@ -435,11 +599,37 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
     let _signals = Signals(old);
     let mut profiles: Vec<Profile> = Vec::new();
     {
-        let _lock = app.lock(o.timeout)?;
+        let waiting = Instant::now();
+        let lock = app.lock_with_cancel(o.timeout, || {
+            if io::stdout().is_terminal() && waiting.elapsed() > Duration::from_millis(250) {
+                let text = format!(
+                    " {} Waiting for auth lock | {:.1}s | Ctrl-C cancels",
+                    ["|", "/", "-", "\\"][(waiting.elapsed().as_millis() / 100 % 4) as usize],
+                    waiting.elapsed().as_secs_f64()
+                );
+                let text: String = text
+                    .chars()
+                    .take(terminal_size().0.saturating_sub(1))
+                    .collect();
+                print!("\r\x1b[2K{text}");
+                let _ = io::stdout().flush();
+            }
+            CANCEL.load(Ordering::Relaxed)
+        });
+        if io::stdout().is_terminal() && waiting.elapsed() > Duration::from_millis(250) {
+            print!("\r\x1b[2K");
+            let _ = io::stdout().flush();
+        }
+        let _lock = match lock {
+            Ok(lock) => lock,
+            Err(_) if CANCEL.load(Ordering::Relaxed) => std::process::exit(130),
+            Err(e) => return Err(e),
+        };
         let active = app.active()?;
         for name in app.profiles()? {
             let path = fs::canonicalize(app.accounts().join(format!("{name}.json")))?;
             profiles.push(Profile {
+                key: format!("profile:{name}"),
                 name,
                 bytes: fs::read(&path)?,
                 current: active.as_ref().is_some_and(|p| p == &path),
@@ -451,7 +641,8 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
             let matches: Vec<_> = profiles.iter_mut().filter(|p| p.bytes == bytes).collect();
             if matches.is_empty() {
                 profiles.push(Profile {
-                    name: "current".into(),
+                    name: "(active)".into(),
+                    key: "active".into(),
                     paths: vec![active],
                     bytes,
                     current: true,
@@ -484,11 +675,13 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
     }
     let start = Instant::now();
     let tty = io::stdout().is_terminal();
-    let progress = io::stderr().is_terminal();
+    let progress = tty || io::stderr().is_terminal();
+    let size = terminal_size();
     let mut cache = load_cache(app);
     cache.retain(|name, entry| {
-        profiles.iter().any(|p| &p.name == name)
-            && entry.windows.len() <= 32
+        profiles.iter().any(|p| {
+            &p.key == name && entry.identity.is_some() && entry.identity == identity(&p.bytes)
+        }) && entry.windows.len() <= 32
             && entry
                 .windows
                 .iter()
@@ -496,8 +689,8 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
     });
     let mut previous_lines = 0;
     if tty {
-        let previous = table(&profiles, &cache, &HashMap::new(), true, true);
-        let columns = terminal_columns();
+        let previous = table(&profiles, &cache, &HashMap::new(), true, true, size.0);
+        let columns = size.0;
         previous_lines = previous
             .lines()
             .map(|line| line.chars().count().div_ceil(columns).max(1))
@@ -520,14 +713,24 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         let mut frame = 0;
         while done < groups.len() {
             if progress {
-                eprint!(
-                    "\r\x1b[2K {} Refreshing weekly limits {}/{} | {:.1}s elapsed",
+                let text = format!(
+                    " {} Refreshing weekly limits {}/{} | {:.1}s elapsed",
                     ["|", "/", "-", "\\"][frame % 4],
                     done,
                     groups.len(),
                     start.elapsed().as_secs_f64()
                 );
-                let _ = io::stderr().flush();
+                let text: String = text
+                    .chars()
+                    .take(terminal_size().0.saturating_sub(1))
+                    .collect();
+                if tty {
+                    print!("\r\x1b[2K{text}");
+                    let _ = io::stdout().flush();
+                } else {
+                    eprint!("\r\x1b[2K{text}");
+                    let _ = io::stderr().flush();
+                }
                 frame += 1;
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -542,25 +745,68 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         }
     });
     if progress {
-        eprint!("\r\x1b[2K");
+        if tty {
+            print!("\r\x1b[2K");
+        } else {
+            eprint!("\r\x1b[2K");
+        }
     }
+    // A concurrent account replacement invalidates old metrics on cancellation too.
+    cache.retain(|key, _| {
+        profiles
+            .iter()
+            .any(|p| &p.key == key && same_account(app, p))
+    });
     if CANCEL.load(Ordering::Relaxed) {
+        if tty {
+            redraw(previous_lines, size);
+            let statuses = profiles
+                .iter()
+                .map(|p| (p.key.clone(), "CANCELLED".into()))
+                .collect();
+            print!(
+                "{}",
+                table(&profiles, &cache, &statuses, false, true, terminal_size().0)
+            );
+            let _ = io::stdout().flush();
+        }
+        eprintln!("\nCancelled; previous limits remain unchanged.");
+        for (i, result) in results.iter().enumerate() {
+            if let Some(Err(e)) = result {
+                if e.contains("preserved at") {
+                    eprintln!("{}: {e}", groups[i].name);
+                }
+            }
+        }
         std::process::exit(130);
     }
     let mut statuses = HashMap::new();
     let mut failed = false;
+    let mut errors = Vec::new();
     for p in &profiles {
         let i = groups.iter().position(|g| g.bytes == p.bytes).unwrap();
-        match results[i].as_ref() {
+        let result = results[i].as_ref();
+        let changed = !same_account(app, p);
+        if changed {
+            cache.remove(&p.key);
+        }
+        let changed_result = Err("account changed during check; retry".to_string());
+        let result = if changed {
+            Some(&changed_result)
+        } else {
+            result
+        };
+        match result {
             Some(Ok(value)) => {
                 let windows = rows(value);
                 statuses.insert(
-                    p.name.clone(),
+                    p.key.clone(),
                     if windows.is_empty() { "N/A" } else { "OK" }.into(),
                 );
                 cache.insert(
-                    p.name.clone(),
+                    p.key.clone(),
                     Cached {
+                        identity: identity(&p.bytes),
                         updated_at: updated_at[i],
                         windows,
                     },
@@ -572,31 +818,53 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
                     .and_then(|r| r.as_ref().err())
                     .map(String::as_str)
                     .unwrap_or("worker failed");
-                statuses.insert(
-                    p.name.clone(),
-                    format!(
-                        "{}: {status}",
-                        if cache.contains_key(&p.name) {
-                            "STALE"
-                        } else {
-                            "ERROR"
+                errors.push(format!("{}: {status}", p.name));
+                if changed {
+                    if let Some(Err(e)) = results[i].as_ref() {
+                        if e.contains("preserved at") {
+                            errors.push(e.clone());
                         }
-                    ),
+                    }
+                }
+                statuses.insert(
+                    p.key.clone(),
+                    if cache.contains_key(&p.key) {
+                        "STALE"
+                    } else {
+                        "ERROR"
+                    }
+                    .into(),
                 );
             }
         }
     }
-    // Cache contains only quota metrics and timestamps, never authentication data.
-    if let Err(e) = atomic(
+    // Cache contains metrics, timestamps and stable identity, never tokens.
+    let mut saved_cache = cache.clone();
+    saved_cache.retain(|_, entry| entry.identity.is_some());
+    let cache_save = atomic(
         &app.data.join("appserver-ctl-limits.json"),
-        &serde_json::to_vec(&cache)?,
-    ) {
+        &serde_json::to_vec(&saved_cache)?,
+    );
+    if tty {
+        redraw(previous_lines, size);
+    }
+    print!(
+        "{}",
+        table(
+            &profiles,
+            &cache,
+            &statuses,
+            false,
+            tty,
+            if tty { terminal_size().0 } else { usize::MAX }
+        )
+    );
+    for error in errors {
+        eprintln!("{error}");
+    }
+    if let Err(e) = cache_save {
         eprintln!("warning: limits cache could not be saved: {e}");
     }
-    if tty {
-        print!("\x1b[{previous_lines}A\r\x1b[J");
-    }
-    print!("{}", table(&profiles, &cache, &statuses, false, tty));
     println!(
         "{} | checked in {:.1}s | timestamps are local",
         if failed {
@@ -681,13 +949,15 @@ mod tests {
     fn cached_table_has_gauge_status_and_account_timestamp() {
         let profile = Profile {
             name: "alpha".into(),
+            key: "profile:alpha".into(),
             paths: vec![],
             bytes: vec![],
             current: true,
         };
         let cache = Cache::from([(
-            "alpha".into(),
+            "profile:alpha".into(),
             Cached {
+                identity: None,
                 updated_at: 1800000000,
                 windows: vec![Window {
                     id: "codex".into(),
@@ -702,6 +972,7 @@ mod tests {
             &HashMap::new(),
             true,
             true,
+            usize::MAX,
         );
         assert!(
             refreshing.contains("┌")
@@ -713,9 +984,10 @@ mod tests {
         let completed = table(
             &[profile],
             &cache,
-            &HashMap::from([("alpha".into(), "OK".into())]),
+            &HashMap::from([("profile:alpha".into(), "OK".into())]),
             false,
             false,
+            usize::MAX,
         );
         assert!(completed.contains("OK") && !completed.contains("REFRESHING"));
         assert_eq!(

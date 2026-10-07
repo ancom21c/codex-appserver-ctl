@@ -181,6 +181,9 @@ impl App {
         ))
     }
     fn lock(&self, timeout: u64) -> Result<File> {
+        self.lock_with_cancel(timeout, || false)
+    }
+    fn lock_with_cancel(&self, timeout: u64, cancelled: impl Fn() -> bool) -> Result<File> {
         self.validate()?;
         let p = self.data.join("appserver-ctl-auth.lock");
         let f = OpenOptions::new()
@@ -197,6 +200,9 @@ impl App {
         }
         let start = Instant::now();
         loop {
+            if cancelled() {
+                return Err(err("cancelled"));
+            }
             if unsafe {
                 libc::flock(
                     std::os::fd::AsRawFd::as_raw_fd(&f),
@@ -971,6 +977,38 @@ fn quote(s: &str) -> String {
 fn join(args: &[String]) -> String {
     args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
 }
+fn supports_command(help: &str, args: &[String]) -> bool {
+    let command = args.first().map(String::as_str).unwrap_or("--help");
+    if matches!(command, "--help" | "-h") {
+        return true;
+    }
+    let commands: Vec<_> = help
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .collect();
+    // update changed meaning in 0.4; both forms require the explicit new subcommand.
+    if command == "update" {
+        return commands
+            .iter()
+            .any(|line| line.starts_with("update codex "));
+    }
+    if command == "auth" {
+        let sub = args.get(1).map(String::as_str).unwrap_or("");
+        return commands.iter().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("auth")
+                && words
+                    .next()
+                    .is_some_and(|word| word.split('|').any(|s| s == sub))
+        });
+    }
+    matches!(command, "true" | "false" | "1" | "0")
+        || commands.iter().any(|line| {
+            line.split([' ', '|', '[']).next() == Some(command)
+                || (matches!(command, "restart" | "stop" | "status")
+                    && line.starts_with("start|restart|stop|status"))
+        })
+}
 fn remote(host: &str, args: &[String]) -> Result<()> {
     let lookup =
         "ctl=$(command -v codex-appserver-ctl) || ctl=\"$HOME/.local/bin/codex-appserver-ctl\"; ";
@@ -983,18 +1021,7 @@ fn remote(host: &str, args: &[String]) -> Result<()> {
         .output()?;
     let help = String::from_utf8_lossy(&probe.stdout);
     let modern = help.contains("auth use [NAME]");
-    let needed =
-        if args.first().is_some_and(|s| s == "auth") && args.get(1).is_some_and(|s| s == "login") {
-            "auth login"
-        } else {
-            args.first().map(String::as_str).unwrap_or("")
-        };
-    let supported = probe.status.success()
-        && (needed.is_empty()
-            || needed == "--help"
-            || needed == "-h"
-            || help.contains(needed)
-            || matches!(needed, "true" | "false" | "restart" | "stop"));
+    let supported = probe.status.success() && supports_command(&help, args);
     let mut installed = false;
     if !supported {
         if !probe.status.success() && probe.status.code() != Some(127) {
@@ -1020,6 +1047,18 @@ fn remote(host: &str, args: &[String]) -> Result<()> {
             return Err(err("installation declined; no changes"));
         }
         install_remote(host)?;
+        let verify = Command::new("ssh")
+            .args([
+                "--",
+                host,
+                "\"$HOME/.local/bin/codex-appserver-ctl\" --help",
+            ])
+            .output()?;
+        if !verify.status.success()
+            || !supports_command(&String::from_utf8_lossy(&verify.stdout), args)
+        {
+            return Err(err("installed remote release does not support the requested command; command was not run"));
+        }
         installed = true;
     }
     let mut forwarded = args.to_vec();

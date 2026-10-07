@@ -199,12 +199,24 @@ use), labeled REFRESHING, then is replaced when all checks complete. REMAINING
 uses a gauge, RESET IN shows a countdown, and LAST UPDATED records each account's
 last successful check. Failed refreshes retain previous metrics with STALE status
 and their original timestamps. A private 0600 `~/.codex/appserver-ctl-limits.json`
-cache stores quota metrics and timestamps only, without credentials. `--watch` enables
+cache stores quota metrics, timestamps, and stable user/workspace identifiers,
+without tokens. Replacing an account invalidates its previous metrics; token
+rotation keeps them. Unknown identities and older unbound caches are not reused.
+An unmanaged active account is labeled `(active)` separately from saved profiles.
+Narrow terminals show a compact table with reset and timestamp details below it.
+Frames that no longer fit after a resize are appended without erasing scrollback.
+`--watch` enables
 keyboard refresh (`r`) and quit (`q`); redirected output remains a plain table.
 Identical credential files share one request. Managed token refreshes are saved
 only if the original files still match, without switching the active account or
 restarting an existing server. Unsupported weekly windows show N/A; individual
-failures remain visible and produce a nonzero exit status. Ctrl-C cancels checks.
+failures remain visible and produce a nonzero exit status. Ctrl-C cancels checks,
+including waits for the authentication lock, and exits with status 130. Token
+rotation is still saved after cancellation or a quota request failure. If a lock
+or concurrent profile edit prevents saving, the error reports a private recovery
+`auth.json` path instead of discarding the rotated credentials. Inspect it and
+reconcile it with the intended account before retrying; never overwrite a profile
+that was replaced during the check.
 
 ## Update Codex CLI
 
@@ -302,7 +314,10 @@ In a non-interactive session or a dry run, it reports the requirement and stops.
 After confirmation, it sends the embedded installer over SSH.
 The target downloads the release that matches the local tool version.
 It verifies the archive digest and installs at `~/.local/bin/codex-appserver-ctl`.
-It then runs the requested command.
+It verifies command support again before running the requested command.
+Version 0.4 changes `update` to self-update and adds `update codex` and `limits`.
+Those commands require the new command signatures; a v0.3 remote must be upgraded
+first, so `update` cannot accidentally restart its Codex server.
 
 The target requires curl, tar, a SHA-256 tool, and HTTPS access to GitHub Releases.
 Cargo and Rust are not required. The tool does not install system packages.
@@ -349,7 +364,10 @@ cargo clippy --all-targets --locked -- -D warnings
 ./install.sh --source
 ```
 
-Tests use temporary profiles, synthetic session records, and fake installers.
+Tests require Python 3 for fake app-servers and SSH probes. The installed CLI has
+no Python runtime dependency. Tests use temporary profiles, synthetic session
+records, fake installers, and real pseudo-terminals. Pull requests run the same
+four-platform checks as releases, without publishing.
 They do not log in, download a Codex release, or restart a live server.
 
 ## Publish a release
@@ -362,8 +380,8 @@ Set the package version in `Cargo.toml` and update `Cargo.lock`.
 Commit the changes. Then push a matching version tag:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 The tag must match the package version. All four builds must pass before publication.
