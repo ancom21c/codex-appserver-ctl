@@ -276,6 +276,10 @@ import json, os, sys, time
 p=os.path.join(os.environ['CODEX_HOME'],'auth.json')
 a=json.load(open(p))
 mode=os.environ.get('TEST_RPC_MODE','ok')
+def ready(name,value):
+ path=os.path.join(os.environ['HOME'],name)
+ with open(path+'.tmp','w') as f: json.dump(value,f)
+ os.replace(path+'.tmp',path)
 for line in sys.stdin:
  v=json.loads(line)
  if 'id' not in v: continue
@@ -285,14 +289,28 @@ for line in sys.stdin:
   if mode=='rotate-error':
    print(json.dumps({'id':v['id'],'error':{'code':-1}}),flush=True)
    continue
+ if v['method']=='account/read' and mode.startswith('queued'):
+  ready('started-'+mode,{'token':a['token'],'auth':p})
+  a['token']+='+'
+  with open(p,'w') as f: json.dump(a,f)
  if v['method']=='account/rateLimits/read':
   if mode=='fail': sys.exit(1)
   if mode=='replace':
    replacement=json.load(open(os.path.join(os.environ['HOME'],'replacement')))
    with open(os.path.join(os.environ['HOME'],'.codex/accounts/alpha.json'),'w') as f: json.dump(replacement,f)
+  if mode=='replace-alias':
+   replacement=json.load(open(os.path.join(os.environ['HOME'],'replacement')))
+   with open(os.path.join(os.environ['HOME'],'.codex/accounts/beta.json'),'w') as f: json.dump(replacement,f)
   if mode=='rotate-hang':
-   with open(os.path.join(os.environ['HOME'],'ready'),'w') as f: json.dump({'pid':os.getpid(),'parent':os.getppid(),'auth':p},f)
+   ready('ready',{'pid':os.getpid(),'parent':os.getppid(),'auth':p})
    time.sleep(30)
+  if mode=='queued-old':
+   while not os.path.exists(os.path.join(os.environ['HOME'],'release-old')): time.sleep(.01)
+  if mode=='queued-new': a['used']=88
+  if mode=='switch-active' and a['name']=='alpha':
+   active=os.path.join(os.environ['HOME'],'.codex/auth.json')
+   os.unlink(active)
+   os.symlink('accounts/beta.json',active)
   if mode=='delay': time.sleep(.4)
   result={'rateLimits':{'secondary':{'windowDurationMins':10080,'usedPercent':a['used'],'resetsAt':1800000000}}}
  else: result={}
@@ -433,6 +451,153 @@ fn waiting_for_initial_auth_lock_is_cancellable() {
     assert!(!t.path().join(".codex/appserver-ctl-limits.json").exists());
 }
 #[test]
+fn concurrent_limits_refreshes_do_not_reuse_rotated_tokens_or_regress_cache() {
+    let t = limits_fixture();
+    let home = t.path();
+    assert!(limits(home, "ok").output().unwrap().status.success());
+    let old = limits(home, "queued-old")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_file(&home.join("started-queued-old"));
+    let new = limits(home, "queued-new")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    let overlapped = home.join("started-queued-new").exists();
+    fs::write(home.join("release-old"), "").unwrap();
+    let older = finish(old);
+    let newer = finish(new);
+    // Clean up any recovery copy produced by the pre-fix race before asserting.
+    let ready: Value =
+        serde_json::from_slice(&fs::read(home.join("started-queued-old")).unwrap()).unwrap();
+    let recovery = Path::new(ready["auth"].as_str().unwrap());
+    if recovery.exists() {
+        fs::remove_dir_all(recovery.parent().unwrap()).unwrap();
+    }
+    assert!(
+        !overlapped,
+        "the same credentials were refreshed by both invocations concurrently"
+    );
+    assert!(
+        older.status.success(),
+        "{}",
+        String::from_utf8_lossy(&older.stderr)
+    );
+    assert!(
+        newer.status.success(),
+        "{}",
+        String::from_utf8_lossy(&newer.stderr)
+    );
+    let ready: Value =
+        serde_json::from_slice(&fs::read(home.join("started-queued-new")).unwrap()).unwrap();
+    assert_eq!(
+        ready["token"], "old+",
+        "queued invocation must resnapshot the rotated auth"
+    );
+    let auth: Value =
+        serde_json::from_slice(&fs::read(home.join(".codex/accounts/alpha.json")).unwrap())
+            .unwrap();
+    assert_eq!(auth["token"], "old++");
+    assert_eq!(cache(home)["profile:alpha"]["windows"][0]["used"], 88.);
+}
+#[test]
+fn current_marker_follows_account_switch_during_refresh() {
+    let t = limits_fixture();
+    let home = t.path();
+    private_json(&home.join(".codex/accounts/beta.json"), &auth("beta", 88));
+    std::os::unix::fs::symlink("accounts/alpha.json", home.join(".codex/auth.json")).unwrap();
+    let out = limits(home, "switch-active").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let alpha = text.lines().find(|l| l.starts_with("| alpha")).unwrap();
+    let beta = text.lines().find(|l| l.starts_with("| beta")).unwrap();
+    assert!(!alpha.contains('*') && beta.contains('*'), "{text}");
+    private_json(&home.join(".codex/accounts/beta.json"), &auth("alpha", 11));
+    private_json(&home.join("replacement"), &auth("replacement", 88));
+    fs::remove_file(home.join(".codex/auth.json")).unwrap();
+    std::os::unix::fs::symlink("accounts/alpha.json", home.join(".codex/auth.json")).unwrap();
+    let out = limits(home, "replace-alias").output().unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let alpha = text.lines().find(|l| l.starts_with("| alpha")).unwrap();
+    let beta = text.lines().find(|l| l.starts_with("| beta")).unwrap();
+    assert!(
+        alpha.contains('*') && !beta.contains('*') && beta.contains("ERROR"),
+        "{text}"
+    );
+}
+#[test]
+fn queued_refresh_keeps_cache_visible_and_lock_wait_is_cancellable() {
+    let t = limits_fixture();
+    let home = t.path();
+    assert!(limits(home, "ok").output().unwrap().status.success());
+    let path = home.join(".codex/appserver-ctl-limits.lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(650));
+            drop(lock);
+        });
+        let (out, text) = pty(&mut limits(home, "ok"), 160, 24, false, false);
+        assert!(out.status.success(), "{text}");
+        let waiting = text.find("Waiting for another limits refresh").unwrap();
+        assert!(
+            text[..waiting].contains("11%") && text[..waiting].contains("REFRESHING"),
+            "{text}"
+        );
+        assert!(text.contains("Refresh complete"));
+    });
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let cached = fs::read(home.join(".codex/appserver-ctl-limits.json")).unwrap();
+    let child = limits(home, "queued-new")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let start = Instant::now();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(130));
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(!home.join("started-queued-new").exists());
+    assert_eq!(
+        fs::read(home.join(".codex/appserver-ctl-limits.json")).unwrap(),
+        cached
+    );
+    drop(lock);
+    // The shared lock helper must apply its existing file-security checks here too.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let out = limits(home, "queued-new").output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unsafe lock file"));
+    assert!(!home.join("started-queued-new").exists());
+}
+#[test]
 fn cache_follows_user_identity_and_preserves_last_good_timestamp() {
     let t = limits_fixture();
     let home = t.path();
@@ -550,6 +715,7 @@ fn pty(
     );
     let mut master = unsafe { fs::File::from_raw_fd(master) };
     let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let interrupt_idle = command.get_envs().any(|(key, _)| key == "TEST_IDLE_SIGINT");
     let mut original: libc::termios = unsafe { std::mem::zeroed() };
     assert_eq!(
         unsafe { libc::tcgetattr(master.as_raw_fd(), &mut original) },
@@ -597,9 +763,14 @@ fn pty(
             }
             let prompts = text.matches("[r] refresh").count();
             if prompts > watch_prompts {
-                master
-                    .write_all(if prompts == 1 { b"r" } else { b"q" })
-                    .unwrap();
+                if interrupt_idle {
+                    std::thread::sleep(Duration::from_millis(50));
+                    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+                } else {
+                    master
+                        .write_all(if prompts == 1 { b"r" } else { b"q" })
+                        .unwrap();
+                }
                 watch_prompts = prompts;
             }
         } else if child.try_wait().unwrap().is_some() {
@@ -673,6 +844,22 @@ fn watch_keyboard_refresh_and_quit_restore_terminal() {
     let (out, text) = pty(&mut command, 160, 24, false, false);
     assert!(out.status.success(), "{text}");
     assert_eq!(text.matches("Refresh complete").count(), 2, "{text}");
+}
+#[test]
+fn watch_idle_sigint_restores_terminal_and_invalid_options_fail_before_watch() {
+    let t = limits_fixture();
+    let mut command = limits(t.path(), "ok");
+    command.arg("--watch").env("TEST_IDLE_SIGINT", "1");
+    let (out, text) = pty(&mut command, 160, 24, false, false);
+    assert_eq!(out.status.code(), Some(130), "{text}");
+    let mut invalid = cli(t.path(), &["limits", "--watch", "--timeout", "0"]);
+    let (out, text) = pty(&mut invalid, 160, 24, false, false);
+    assert!(
+        !out.status.success()
+            && !text.contains("CODEX / WEEKLY LIMITS")
+            && !text.contains("[r] refresh"),
+        "{text}"
+    );
 }
 #[test]
 fn account_replacement_during_cancellation_hides_old_metrics_and_preserves_rotation() {

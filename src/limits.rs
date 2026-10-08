@@ -1,4 +1,4 @@
-use crate::{atomic, err, options, App, Result};
+use crate::{atomic, err, options, App, Options, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -37,7 +37,7 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Profile {
     name: String,
     key: String,
@@ -343,15 +343,25 @@ fn rows(value: &Value) -> Vec<Window> {
     }
     rows
 }
-fn load_cache(app: &App) -> Cache {
+fn load_cache(app: &App, profiles: &[Profile]) -> Cache {
     let path = app.data.join("appserver-ctl-limits.json");
     if !app.secure(&path) {
         return Cache::new();
     }
-    fs::read(path)
+    let mut cache: Cache = fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cache.retain(|name, entry| {
+        profiles.iter().any(|p| {
+            &p.key == name && entry.identity.is_some() && entry.identity == identity(&p.bytes)
+        }) && entry.windows.len() <= 32
+            && entry
+                .windows
+                .iter()
+                .all(|w| w.used.is_finite() && w.used >= 0.)
+    });
+    cache
 }
 fn percentage(n: f64) -> String {
     if n >= 10000. {
@@ -476,7 +486,7 @@ fn table(
     };
     let full_width = widths_for(&full_table).iter().sum::<usize>() + 3 * 9 + 1;
     let compact = full_width > columns;
-    let mut table = full_table.clone();
+    let mut compact_table = Vec::new();
     if compact {
         let selection = if columns >= 75 {
             vec![0, 1, 3, 4, 7]
@@ -485,21 +495,22 @@ fn table(
         } else {
             vec![0, 3]
         };
-        table = full_table
+        compact_table = full_table
             .iter()
             .map(|r| selection.iter().map(|i| r[*i].clone()).collect())
             .collect();
         // All omitted columns remain available below, including full profile names.
-        let widths = widths_for(&table);
+        let widths = widths_for(&compact_table);
         let other = widths.iter().skip(1).sum::<usize>() + 3 * widths.len() + 1;
         let limit = columns.saturating_sub(other).max(7);
-        for r in &mut table {
+        for r in &mut compact_table {
             if r[0].chars().count() > limit {
                 r[0] = format!("{}…", r[0].chars().take(limit - 1).collect::<String>());
             }
         }
     }
-    let widths = widths_for(&table);
+    let table = if compact { &compact_table } else { &full_table };
+    let widths = widths_for(table);
     let mut output = String::new();
     let borders = if unicode {
         ["┌", "┬", "┐", "├", "┼", "┤", "└", "┴", "┘", "─", "│"]
@@ -581,85 +592,144 @@ fn redraw(lines: usize, size: (usize, usize)) {
         println!();
     }
 }
-fn report_once(app: &App, args: &[String]) -> Result<()> {
-    let o = options(args)?;
-    if !o.pos.is_empty() || o.force || o.dry || o.internal || !o.restart {
-        return Err(err("limits accepts only --timeout N"));
+fn print_progress(text: &str) {
+    let tty = io::stdout().is_terminal();
+    if !tty && !io::stderr().is_terminal() {
+        return;
     }
-    CANCEL.store(false, Ordering::Relaxed);
-    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = interrupt as *const () as usize;
-    unsafe {
-        libc::sigemptyset(&mut action.sa_mask);
-        if libc::sigaction(libc::SIGINT, &action, &mut old) != 0 {
-            return Err(io::Error::last_os_error().into());
+    let text: String = text
+        .chars()
+        .take(terminal_size().0.saturating_sub(1))
+        .collect();
+    if tty {
+        print!("\r\x1b[2K{text}");
+        let _ = io::stdout().flush();
+    } else {
+        eprint!("\r\x1b[2K{text}");
+        let _ = io::stderr().flush();
+    }
+}
+fn wait_for_lock(app: &App, filename: &str, label: &str, timeout: u64) -> Result<fs::File> {
+    let waiting = Instant::now();
+    let lock = app.lock_named(filename, timeout, || {
+        if waiting.elapsed() > Duration::from_millis(250) {
+            print_progress(&format!(
+                " {} Waiting for {label} | {:.1}s | Ctrl-C cancels",
+                ["|", "/", "-", "\\"][(waiting.elapsed().as_millis() / 100 % 4) as usize],
+                waiting.elapsed().as_secs_f64()
+            ));
         }
+        CANCEL.load(Ordering::Relaxed)
+    });
+    if waiting.elapsed() > Duration::from_millis(250) {
+        print_progress("");
     }
-    let _signals = Signals(old);
-    let mut profiles: Vec<Profile> = Vec::new();
-    {
-        let waiting = Instant::now();
-        let lock = app.lock_with_cancel(o.timeout, || {
-            if io::stdout().is_terminal() && waiting.elapsed() > Duration::from_millis(250) {
-                let text = format!(
-                    " {} Waiting for auth lock | {:.1}s | Ctrl-C cancels",
-                    ["|", "/", "-", "\\"][(waiting.elapsed().as_millis() / 100 % 4) as usize],
-                    waiting.elapsed().as_secs_f64()
-                );
-                let text: String = text
-                    .chars()
-                    .take(terminal_size().0.saturating_sub(1))
-                    .collect();
-                print!("\r\x1b[2K{text}");
-                let _ = io::stdout().flush();
-            }
-            CANCEL.load(Ordering::Relaxed)
+    match lock {
+        Err(_) if CANCEL.load(Ordering::Relaxed) => {
+            eprintln!("Cancelled while waiting for {label}.");
+            std::process::exit(130);
+        }
+        other => other,
+    }
+}
+fn read_profiles(app: &App, timeout: u64) -> Result<Vec<Profile>> {
+    let _lock = wait_for_lock(app, "appserver-ctl-auth.lock", "auth lock", timeout)?;
+    let mut profiles = Vec::new();
+    let active = app.active()?;
+    for name in app.profiles()? {
+        let path = fs::canonicalize(app.accounts().join(format!("{name}.json")))?;
+        profiles.push(Profile {
+            key: format!("profile:{name}"),
+            name,
+            bytes: fs::read(&path)?,
+            current: active.as_ref().is_some_and(|p| p == &path),
+            paths: vec![path],
         });
-        if io::stdout().is_terminal() && waiting.elapsed() > Duration::from_millis(250) {
-            print!("\r\x1b[2K");
-            let _ = io::stdout().flush();
-        }
-        let _lock = match lock {
-            Ok(lock) => lock,
-            Err(_) if CANCEL.load(Ordering::Relaxed) => std::process::exit(130),
-            Err(e) => return Err(e),
-        };
-        let active = app.active()?;
-        for name in app.profiles()? {
-            let path = fs::canonicalize(app.accounts().join(format!("{name}.json")))?;
+    }
+    if let Some(active) = active {
+        let bytes = fs::read(&active)?;
+        let matches: Vec<_> = profiles.iter_mut().filter(|p| p.bytes == bytes).collect();
+        if matches.is_empty() {
             profiles.push(Profile {
-                key: format!("profile:{name}"),
-                name,
-                bytes: fs::read(&path)?,
-                current: active.as_ref().is_some_and(|p| p == &path),
-                paths: vec![path],
+                name: "(active)".into(),
+                key: "active".into(),
+                paths: vec![active],
+                bytes,
+                current: true,
             });
-        }
-        if let Some(active) = active {
-            let bytes = fs::read(&active)?;
-            let matches: Vec<_> = profiles.iter_mut().filter(|p| p.bytes == bytes).collect();
-            if matches.is_empty() {
-                profiles.push(Profile {
-                    name: "(active)".into(),
-                    key: "active".into(),
-                    paths: vec![active],
-                    bytes,
-                    current: true,
-                });
-            } else {
-                for p in matches {
-                    p.current = true;
-                    if !p.paths.contains(&active) {
-                        p.paths.push(active.clone());
-                    }
+        } else {
+            for p in matches {
+                p.current = true;
+                if !p.paths.contains(&active) {
+                    p.paths.push(active.clone());
                 }
             }
         }
     }
+    Ok(profiles)
+}
+fn mark_current(app: &App, profiles: &mut [Profile]) -> Result<()> {
+    for profile in profiles.iter_mut() {
+        profile.current = false;
+    }
+    if let Some(active) = app.active()? {
+        let bytes = fs::read(&active)?;
+        for profile in profiles {
+            let source = &profile.paths[0];
+            profile.current = source == &active
+                || (app.secure(source) && fs::read(source).is_ok_and(|b| b == bytes));
+        }
+    }
+    Ok(())
+}
+fn show_pending(profiles: &[Profile], cache: &Cache) -> Result<(usize, (usize, usize))> {
+    let size = terminal_size();
+    if !io::stdout().is_terminal() {
+        return Ok((0, size));
+    }
+    let text = table(profiles, cache, &HashMap::new(), true, true, size.0);
+    let lines = text
+        .lines()
+        .map(|line| line.chars().count().div_ceil(size.0).max(1))
+        .sum();
+    print!("{text}");
+    io::stdout().flush()?;
+    Ok((lines, size))
+}
+fn report_once(app: &App, o: &Options) -> Result<()> {
+    let mut profiles = read_profiles(app, o.timeout)?;
     if profiles.is_empty() {
         println!("No connected accounts. Use auth login NAME.");
         return Ok(());
+    }
+    let start = Instant::now();
+    let tty = io::stdout().is_terminal();
+    let progress = tty || io::stderr().is_terminal();
+    let mut cache = load_cache(app, &profiles);
+    let (mut previous_lines, mut size) = show_pending(&profiles, &cache)?;
+    // ponytail: one batch per account store; per-account locks if independent batch throughput matters.
+    let _refresh = wait_for_lock(
+        app,
+        "appserver-ctl-limits.lock",
+        "another limits refresh",
+        o.timeout,
+    )?;
+    let fresh = read_profiles(app, o.timeout)?;
+    let queued = start.elapsed() > Duration::from_millis(250) || fresh != profiles;
+    profiles = fresh;
+    cache = load_cache(app, &profiles);
+    if profiles.is_empty() {
+        if tty {
+            redraw(previous_lines, size);
+        }
+        println!("No connected accounts. Use auth login NAME.");
+        return Ok(());
+    }
+    if queued {
+        if tty {
+            redraw(previous_lines, size);
+        }
+        (previous_lines, size) = show_pending(&profiles, &cache)?;
     }
     let mut groups: Vec<Profile> = Vec::new();
     for p in &profiles {
@@ -672,31 +742,6 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         } else {
             groups.push(p.clone());
         }
-    }
-    let start = Instant::now();
-    let tty = io::stdout().is_terminal();
-    let progress = tty || io::stderr().is_terminal();
-    let size = terminal_size();
-    let mut cache = load_cache(app);
-    cache.retain(|name, entry| {
-        profiles.iter().any(|p| {
-            &p.key == name && entry.identity.is_some() && entry.identity == identity(&p.bytes)
-        }) && entry.windows.len() <= 32
-            && entry
-                .windows
-                .iter()
-                .all(|w| w.used.is_finite() && w.used >= 0.)
-    });
-    let mut previous_lines = 0;
-    if tty {
-        let previous = table(&profiles, &cache, &HashMap::new(), true, true, size.0);
-        let columns = size.0;
-        previous_lines = previous
-            .lines()
-            .map(|line| line.chars().count().div_ceil(columns).max(1))
-            .sum::<usize>();
-        print!("{previous}");
-        io::stdout().flush()?;
     }
     let (tx, rx) = mpsc::channel();
     let mut results = vec![None; groups.len()];
@@ -720,17 +765,7 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
                     groups.len(),
                     start.elapsed().as_secs_f64()
                 );
-                let text: String = text
-                    .chars()
-                    .take(terminal_size().0.saturating_sub(1))
-                    .collect();
-                if tty {
-                    print!("\r\x1b[2K{text}");
-                    let _ = io::stdout().flush();
-                } else {
-                    eprint!("\r\x1b[2K{text}");
-                    let _ = io::stderr().flush();
-                }
+                print_progress(&text);
                 frame += 1;
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -745,12 +780,11 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         }
     });
     if progress {
-        if tty {
-            print!("\r\x1b[2K");
-        } else {
-            eprint!("\r\x1b[2K");
-        }
+        print_progress("");
     }
+    let active_error = mark_current(app, &mut profiles)
+        .err()
+        .map(|e| format!("active account check failed: {e}"));
     // A concurrent account replacement invalidates old metrics on cancellation too.
     cache.retain(|key, _| {
         profiles
@@ -778,11 +812,14 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
                 }
             }
         }
+        if let Some(error) = active_error {
+            eprintln!("{error}");
+        }
         std::process::exit(130);
     }
     let mut statuses = HashMap::new();
-    let mut failed = false;
-    let mut errors = Vec::new();
+    let mut failed = active_error.is_some();
+    let mut errors: Vec<String> = active_error.into_iter().collect();
     for p in &profiles {
         let i = groups.iter().position(|g| g.bytes == p.bytes).unwrap();
         let result = results[i].as_ref();
@@ -839,12 +876,15 @@ fn report_once(app: &App, args: &[String]) -> Result<()> {
         }
     }
     // Cache contains metrics, timestamps and stable identity, never tokens.
-    let mut saved_cache = cache.clone();
-    saved_cache.retain(|_, entry| entry.identity.is_some());
+    let saved_cache: HashMap<_, _> = cache
+        .iter()
+        .filter(|(_, entry)| entry.identity.is_some())
+        .collect();
     let cache_save = atomic(
         &app.data.join("appserver-ctl-limits.json"),
         &serde_json::to_vec(&saved_cache)?,
     );
+    drop(_refresh);
     if tty {
         redraw(previous_lines, size);
     }
@@ -901,12 +941,27 @@ pub fn report(app: &App, args: &[String]) -> Result<()> {
             return Err(err("limits accepts --timeout N and --watch"));
         }
     }
+    let o = options(&args)?;
+    if !o.pos.is_empty() || o.force || o.dry || o.internal || !o.restart {
+        return Err(err("limits accepts --timeout N and --watch"));
+    }
+    CANCEL.store(false, Ordering::Relaxed);
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = interrupt as *const () as usize;
+    unsafe {
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &action, &mut old) != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+    }
+    let _signals = Signals(old);
     let interactive = watch && io::stdin().is_terminal() && io::stdout().is_terminal();
     loop {
         if interactive {
             print!("\x1b[2J\x1b[H\x1b[1;36mCODEX / WEEKLY LIMITS\x1b[0m\n\n");
         }
-        let result = report_once(app, &args);
+        let result = report_once(app, &o);
         if !interactive {
             return result;
         }
@@ -927,6 +982,26 @@ pub fn report(app: &App, args: &[String]) -> Result<()> {
         let terminal = Terminal(original);
         let mut key = [0];
         loop {
+            if CANCEL.load(Ordering::Relaxed) {
+                drop(terminal);
+                std::process::exit(130);
+            }
+            let mut poll = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            if ready == 0 {
+                continue;
+            }
             if io::stdin().read(&mut key)? == 0 || key[0] == b'q' {
                 return result;
             }

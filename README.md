@@ -207,7 +207,16 @@ Narrow terminals show a compact table with reset and timestamp details below it.
 Frames that no longer fit after a resize are appended without erasing scrollback.
 `--watch` enables
 keyboard refresh (`r`) and quit (`q`); redirected output remains a plain table.
-Identical credential files share one request. Managed token refreshes are saved
+Identical credential files share one request.
+
+Concurrent `limits` invocations on the same account store serialize their refresh
+batches, while accounts within each batch are still checked in parallel. A queued
+invocation shows cached metrics and a cancellable waiting indicator, then reloads
+credentials and cache after the preceding refresh finishes. This prevents duplicate
+token rotation and an older batch overwriting a newer cache. The refresh lock is
+released before final terminal output and while `--watch` waits for keyboard input.
+CURRENT is rechecked before displaying the result, including changes to aliases.
+Managed token refreshes are saved
 only if the original files still match, without switching the active account or
 restarting an existing server. Unsupported weekly windows show N/A; individual
 failures remain visible and produce a nonzero exit status. Ctrl-C cancels checks,

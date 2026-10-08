@@ -184,8 +184,16 @@ impl App {
         self.lock_with_cancel(timeout, || false)
     }
     fn lock_with_cancel(&self, timeout: u64, cancelled: impl Fn() -> bool) -> Result<File> {
+        self.lock_named("appserver-ctl-auth.lock", timeout, cancelled)
+    }
+    fn lock_named(
+        &self,
+        filename: &str,
+        timeout: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<File> {
         self.validate()?;
-        let p = self.data.join("appserver-ctl-auth.lock");
+        let p = self.data.join(filename);
         let f = OpenOptions::new()
             .read(true)
             .write(true)
@@ -196,7 +204,7 @@ impl App {
             .open(p)?;
         let m = f.metadata()?;
         if !m.is_file() || m.uid() != self.uid || m.mode() & 0o777 != 0o600 || m.nlink() != 1 {
-            return Err(err("unsafe auth lock"));
+            return Err(err("unsafe lock file"));
         }
         let start = Instant::now();
         loop {
@@ -212,8 +220,15 @@ impl App {
             {
                 return Ok(f);
             }
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                return Err(error.into());
+            }
             if start.elapsed() > Duration::from_secs(timeout) {
-                return Err(err("timed out waiting for auth lock"));
+                return Err(err(format!("timed out waiting for {filename}")));
             }
             thread::sleep(Duration::from_millis(50));
         }
