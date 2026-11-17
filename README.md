@@ -102,6 +102,7 @@ They do not add a Python, Node.js, or ccusage runtime requirement.
 
 Each host has its own profiles in `~/.codex/accounts/`.
 The tool uses `~/.codex` on the selected host.
+If a profile is missing, `auth use NAME` reports it and suggests logging in on that host.
 
 | Command | Function |
 | --- | --- |
@@ -159,6 +160,8 @@ codex-appserver-ctl stop
 The tool uses the Codex daemon commands for a managed server.
 On macOS, it can stop and reopen an app-hosted server in ChatGPT or Codex.
 An unmanaged server requires its own launcher to restart.
+If profile selection fails because a server is unmanaged, the previous authentication
+is restored. Use `auth use NAME --no-restart`, then restart it with its original launcher.
 Use `--force` to permit SIGKILL if a graceful stop fails.
 
 A command that must restart its own parent server runs in a detached process.
