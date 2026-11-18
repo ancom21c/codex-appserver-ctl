@@ -350,6 +350,20 @@ codex-appserver-ctl remote-control bootstrap
 `status` shows daemon state. `bootstrap` sets up a daemon with remote control.
 Add `--target MY_SERVER` for a remote host.
 
+If `start` reports that the control socket is served by an unmanaged app-server,
+Linux 6.5 and later support a forced restart:
+
+```sh
+codex-appserver-ctl remote-control start --force
+```
+
+The tool verifies that the socket peer is a Codex app-server owned by the current
+user. It sends `SIGTERM`, waits up to five seconds, and sends `SIGKILL` if the
+same process is still running. Once it exits, the tool retries `start` once.
+This can interrupt work connected to that app-server. A supervisor may recreate
+the conflict by starting another listener. For SSH use, install a build that
+supports this option on the target host as well.
+
 ## Diagnostics and logs
 
 ```sh
@@ -361,6 +375,8 @@ codex-appserver-ctl logs --unit YOUR_USER_SERVICE
 ```
 
 `doctor` checks CLI availability, authentication, profiles, and command support.
+It warns when the control socket responds but the Codex daemon does not manage
+the listener.
 `logs` selects the latest matching local log unless you specify a file or unit.
 `--unit` uses the user journal on Linux.
 

@@ -74,6 +74,151 @@ fn cli(root: &Path, args: &[&str]) -> Command {
     );
     c
 }
+
+#[test]
+fn doctor_distinguishes_an_unmanaged_control_socket() {
+    let t = fixture();
+    let home = t.path();
+    fs::create_dir(home.join(".codex")).unwrap();
+    private_json(&home.join(".codex/auth.json"), &auth("test", 0));
+    let fake = home.join("bin/codex");
+    executable(
+        &fake,
+        r#"#!/bin/sh
+case "$*" in
+ 'app-server daemon version') printf '%s\n' "$TEST_DAEMON_STATE" ;;
+ '--version'|*'--help') echo 'codex TEST' ;;
+ *) exit 3 ;;
+esac
+"#,
+    );
+    for managed in [false, true] {
+        let mut state = json!({"status": "running", "socketPath": "/test/control.sock"});
+        if managed {
+            state["backend"] = json!("pid");
+        }
+        let output = cli(home, &["doctor"])
+            .env("CODEX_APPSERVER_HOST_CODEX", &fake)
+            .env("TEST_DAEMON_STATE", state.to_string())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{text}");
+        assert_eq!(text.contains("OK daemon:"), managed, "{text}");
+        assert_eq!(
+            text.contains("WARN daemon: running but unmanaged"),
+            !managed
+        );
+        assert_eq!(text.contains("/test/control.sock"), !managed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forced_remote_start_only_replaces_the_conflicting_codex_peer() {
+    use std::os::unix::process::ExitStatusExt;
+
+    struct Listener(Child);
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let t = fixture();
+    let root = t.path();
+    let socket_dir = root.join(".codex/app-server-control");
+    fs::create_dir_all(&socket_dir).unwrap();
+    let control_socket = socket_dir.join("app-server-control.sock");
+    fs::copy("/usr/bin/python3", root.join("codex")).unwrap();
+    fs::copy("/usr/bin/python3", root.join("proxy")).unwrap();
+    fs::write(
+        root.join("app-server"),
+        r#"import signal, socket, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with socket.socket(socket.AF_UNIX) as listener:
+    listener.bind(sys.argv[1])
+    listener.listen()
+    open(sys.argv[1] + '.ready', 'w').close()
+    while True:
+        listener.accept()[0].close()
+"#,
+    )
+    .unwrap();
+    let start_listener = |binary: &str, socket: &Path| {
+        let process = Listener(
+            Command::new(root.join(binary))
+                .current_dir(root)
+                .arg("app-server")
+                .arg(socket)
+                .spawn()
+                .unwrap(),
+        );
+        wait_file(&socket.with_extension("sock.ready"));
+        process
+    };
+    let fake_cli = root.join("bin/codex");
+    executable(
+        &fake_cli,
+        r#"#!/bin/sh
+sock="$CODEX_HOME/app-server-control/app-server-control.sock"
+case "$*" in
+ 'app-server daemon version')
+    backend=
+    [ ! -f "$HOME/managed" ] || backend=',"backend":"pid"'
+    printf '{"status":"running","socketPath":"%s","appServerVersion":"0.167.0"%s}\n' "$sock" "$backend" ;;
+ 'remote-control start')
+    if python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])' "$sock" 2>/dev/null; then
+      echo 'Error: app server is running but is not managed by codex app-server daemon' >&2
+      exit 1
+    fi
+    touch "$HOME/restarted" ;;
+ *) exit 3 ;;
+esac
+"#,
+    );
+    let invoke = |flags: &[&str]| {
+        cli(root, &["remote-control", "start", "--timeout", "2"])
+            .args(flags)
+            .env("CODEX_APPSERVER_HOST_CODEX", &fake_cli)
+            .output()
+            .unwrap()
+    };
+
+    let mut unrelated = start_listener("proxy", &control_socket);
+    let refused = invoke(&["--force"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(unrelated.0.try_wait().unwrap().is_none());
+    assert!(!root.join("restarted").exists());
+    if stderr.contains("requires Linux 6.5+ (SO_PEERPIDFD)") {
+        return;
+    }
+    assert!(stderr.contains("is not a Codex app-server"), "{stderr}");
+    drop(unrelated);
+    fs::remove_file(&control_socket).unwrap();
+    fs::remove_file(control_socket.with_extension("sock.ready")).unwrap();
+
+    let mut conflicting = start_listener("codex", &control_socket);
+    let mut other = start_listener("codex", &root.join("other.sock"));
+    assert!(!invoke(&[]).status.success());
+    assert!(invoke(&["--force", "--dry-run"]).status.success());
+    fs::write(root.join("managed"), "").unwrap();
+    let refused = invoke(&["--force"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("could not confirm an unmanaged"));
+    fs::remove_file(root.join("managed")).unwrap();
+    assert!(conflicting.0.try_wait().unwrap().is_none());
+    let result = invoke(&["--force"]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(stderr.contains("SIGTERM") && stderr.contains("SIGKILL"));
+    assert_eq!(conflicting.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    assert!(other.0.try_wait().unwrap().is_none());
+    assert!(root.join("restarted").exists());
+}
+
 #[test]
 fn update_installs_official_script_then_restarts() {
     let t = fixture();

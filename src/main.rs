@@ -1,4 +1,6 @@
 mod limits;
+#[cfg(target_os = "linux")]
+mod socket_peer;
 mod usage;
 use serde_json::Value;
 use std::{
@@ -20,8 +22,11 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 fn err(message: impl Into<String>) -> Box<dyn Error> {
     message.into().into()
 }
+fn is_unmanaged_daemon(state: &Value) -> bool {
+    state["status"] == "running" && state.get("backend").is_none()
+}
 const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
-const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start|stop|pair|enable|disable|status|bootstrap\n  update [--timeout N] [--dry-run]\n  update codex [--no-restart] [--timeout N] [--dry-run]\n  limits [--timeout N] [--watch]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  --version\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Remote binary installation requires curl, tar, and a SHA-256 tool.\nUsage reads local history. It does not query remaining account limits.\n";
+const HELP: &str = "Control Codex locally on macOS/Linux or over SSH.\n\nCommands:\n  auth list|current\n  auth login NAME [--force] [--timeout N]\n  auth save NAME [--force] [--dry-run]\n  save NAME [--force] [--dry-run]\n  auth use [NAME] [--no-restart] [--dry-run]\n  start|restart|stop|status\n  remote-control start [--force] [--dry-run]\n  remote-control stop|pair|enable|disable|status|bootstrap\n  update [--timeout N] [--dry-run]\n  update codex [--no-restart] [--timeout N] [--dry-run]\n  limits [--timeout N] [--watch]\n  usage [daily|monthly|session] [--json] [--since DATE] [--until DATE] [--last DAYS] [--prices FILE]\n  doctor\n  targets\n  --version\n  logs [--follow] [--lines N] [--file PATH|--unit UNIT]\n\nAdd --target MY_SERVER to execute through SSH. Omit it for the current host.\nRemote installation requires confirmation. Remote binary installation requires curl, tar, and a SHA-256 tool.\nUsage reads local history. It does not query remaining account limits.\n";
 struct App {
     home: PathBuf,
     data: PathBuf,
@@ -421,16 +426,21 @@ impl App {
     fn within(&self) -> Result<bool> {
         let rows = self.processes()?;
         let servers = self.servers(&rows);
+        Ok(Self::has_ancestor(&rows, |pid| {
+            servers.iter().any(|server| server.pid == pid)
+        }))
+    }
+    fn has_ancestor(rows: &[Proc], matches: impl Fn(i32) -> bool) -> bool {
         let parents: HashMap<_, _> = rows.iter().map(|p| (p.pid, p.parent)).collect();
         let mut pid = std::process::id() as i32;
         let mut seen = BTreeSet::new();
         while pid > 1 && seen.insert(pid) {
-            if servers.iter().any(|s| s.pid == pid) {
-                return Ok(true);
+            if matches(pid) {
+                return true;
             }
             pid = *parents.get(&pid).unwrap_or(&0);
         }
-        Ok(false)
+        false
     }
     fn schedule(&self, args: &[&str], o: &Options) -> Result<()> {
         self.validate()?;
@@ -598,13 +608,63 @@ impl App {
             _ => return Err(err("unknown remote-control command")),
         };
         if o.dry {
+            if action == "start" && o.force {
+                println!("dry-run recover only from an unmanaged Codex control socket conflict");
+            }
             println!("dry-run codex {}", args.join(" "));
             return Ok(());
         }
         if !o.internal && action != "pair" && action != "status" && self.within()? {
             return self.schedule(&["remote-control", action], o);
         }
+        if action == "start" && o.force {
+            return self.force_remote_control_start(&args, o);
+        }
         run(&mut self.command(&args)?, o.timeout)
+    }
+    fn force_remote_control_start(&self, args: &[&str], o: &Options) -> Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (args, o);
+            Err(err(
+                "remote-control start --force is supported only on Linux",
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let error = match capture(&mut self.command(args)?, o.timeout) {
+                Ok(output) => {
+                    print!("{output}");
+                    return Ok(());
+                }
+                Err(error) => error,
+            };
+            if !error
+                .to_string()
+                .contains("app server is running but is not managed by codex app-server daemon")
+            {
+                return Err(error);
+            }
+            self.validate()?;
+            let socket = self
+                .data
+                .canonicalize()?
+                .join("app-server-control/app-server-control.sock");
+            let peer = socket_peer::CodexPeer::connect(&socket, self.uid)?;
+            if !o.internal && Self::has_ancestor(&self.processes()?, |pid| peer.pid() == pid) {
+                return self.schedule(&["remote-control", "start"], o);
+            }
+            if !self.state().is_some_and(|state| {
+                is_unmanaged_daemon(&state)
+                    && state["socketPath"].as_str().map(Path::new) == Some(socket.as_path())
+            }) {
+                return Err(err(
+                    "could not confirm an unmanaged Codex daemon on the control socket",
+                ));
+            }
+            peer.stop(&socket, o.timeout)?;
+            run(&mut self.command(args)?, o.timeout)
+        }
     }
     fn update_self(&self, o: &Options) -> Result<()> {
         const URL: &str =
@@ -769,10 +829,19 @@ impl App {
                     .map(|_| "supported".into()),
             );
         }
-        if let Some(v) = self.state() {
-            println!("OK daemon: {}", v["status"])
-        } else {
-            println!("WARN daemon: unavailable; macOS may use an app-hosted server")
+        match self.state() {
+            Some(state) if is_unmanaged_daemon(&state) => {
+                println!("WARN daemon: running but unmanaged");
+                if let Some(socket) = state["socketPath"].as_str() {
+                    println!("  Control socket: {socket}");
+                }
+                println!("  Stop the server with its original launcher on this host, then retry remote-control start.");
+                if cfg!(target_os = "linux") {
+                    println!("  On Linux 6.5 or later, remote-control start --force can replace the conflicting server.");
+                }
+            }
+            Some(state) => println!("OK daemon: {}", state["status"]),
+            None => println!("WARN daemon: unavailable; macOS may use an app-hosted server"),
         }
         if failed {
             return Err(err("doctor found failed checks"));
@@ -1001,6 +1070,14 @@ fn supports_command(help: &str, args: &[String]) -> bool {
         .lines()
         .filter_map(|line| line.strip_prefix("  "))
         .collect();
+    if command == "remote-control"
+        && args.iter().any(|arg| arg == "start")
+        && args.iter().any(|arg| arg == "--force")
+    {
+        return commands
+            .iter()
+            .any(|line| line.starts_with("remote-control start [--force]"));
+    }
     // update changed meaning in 0.4; both forms require the explicit new subcommand.
     if command == "update" {
         return commands
