@@ -409,8 +409,8 @@ Set the package version in `Cargo.toml` and update `Cargo.lock`.
 Commit the changes. Then push a matching version tag:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 The tag must match the package version. All four builds must pass before publication.
