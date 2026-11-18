@@ -330,8 +330,15 @@ impl App {
                     .ok_or_else(|| err("invalid selection"))?
             }
         };
-        let profile = self.accounts().join(format!("{n}.json"));
+        let profile_file = format!("{n}.json");
+        let profile = self.accounts().join(&profile_file);
         if !self.secure(&profile) {
+            if matches!(fs::symlink_metadata(&profile), Err(e) if e.kind() == io::ErrorKind::NotFound)
+            {
+                return Err(err(format!(
+                    "profile '{n}' not found on this host; on the host where this command ran, run `codex-appserver-ctl auth login {profile_file} --timeout 900` first"
+                )));
+            }
             return Err(err("profile must be an owned 0600 JSON file"));
         }
         self.active()?;
@@ -343,7 +350,7 @@ impl App {
             return Ok(());
         }
         if o.restart && !o.internal && self.within()? {
-            return self.schedule(&["auth", "use", &n], o);
+            return self.schedule(&["auth", "use", &profile_file], o);
         }
         let _lock = self.lock(o.timeout)?;
         self.prepare()?;
@@ -354,7 +361,7 @@ impl App {
         let current = self.data.join("current");
         let old_auth = Snapshot::read(&auth)?;
         let old_current = Snapshot::read(&current)?;
-        let result = (|| {
+        let result: Result<()> = (|| {
             atomic_link(&fs::canonicalize(&profile)?, &auth)?;
             atomic(&current, format!("{n}\n").as_bytes())?;
             if o.restart {
@@ -369,6 +376,14 @@ impl App {
             let b = old_current.restore(&current);
             if a.is_err() || b.is_err() {
                 return Err(err(format!("{e}; auth rollback failed")));
+            }
+            let message = e.to_string();
+            if message.contains("not managed by codex app-server daemon")
+                || message == "cannot restart an unmanaged standalone server"
+            {
+                return Err(err(format!(
+                    "{e}; profile selection was rolled back; on the host where this command ran, run `codex-appserver-ctl auth use {profile_file} --no-restart` and restart the app-server with its original launcher"
+                )));
             }
             return Err(e);
         }
@@ -1519,6 +1534,87 @@ mod tests {
         assert_eq!(name("work.json").unwrap(), "work");
         assert!(!options(&["--restart=false".into()]).unwrap().restart);
         assert!(options(&["--timeout=0".into()]).is_err());
+    }
+    #[test]
+    fn missing_profile_suggests_login_without_changing_active_auth() {
+        let t = tempfile::tempdir().unwrap();
+        let a = app(t.path());
+        fs::create_dir(&a.data).unwrap();
+        atomic(&a.data.join("auth.json"), br#"{"active":1}"#).unwrap();
+        let o = options(&["--no-restart".into()]).unwrap();
+        let message = a
+            .auth_use(Some("work.json.json"), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("profile 'work.json' not found on this host"));
+        assert!(message.contains("on the host where this command ran"));
+        assert!(message.contains("codex-appserver-ctl auth login work.json.json --timeout 900"));
+        assert_eq!(
+            fs::read(a.data.join("auth.json")).unwrap(),
+            br#"{"active":1}"#
+        );
+        assert!(!a.data.join("current").exists());
+        assert!(!a.accounts().exists());
+    }
+    #[test]
+    fn unsafe_profiles_are_not_reported_as_missing() {
+        let t = tempfile::tempdir().unwrap();
+        let a = app(t.path());
+        fs::create_dir(&a.data).unwrap();
+        a.prepare().unwrap();
+        let p = a.accounts().join("work.json");
+        let o = options(&["--no-restart".into()]).unwrap();
+        for bytes in [b"invalid".as_slice(), b"{}"] {
+            atomic(&p, bytes).unwrap();
+            assert_eq!(
+                a.auth_use(Some("work"), &o).unwrap_err().to_string(),
+                "profile must be an owned 0600 JSON file"
+            );
+        }
+        atomic(&p, br#"{"active":1}"#).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            a.auth_use(Some("work"), &o).unwrap_err().to_string(),
+            "profile must be an owned 0600 JSON file"
+        );
+        fs::remove_file(&p).unwrap();
+        symlink("missing.json", &p).unwrap();
+        assert_eq!(
+            a.auth_use(Some("work"), &o).unwrap_err().to_string(),
+            "profile must be an owned 0600 JSON file"
+        );
+        assert!(!a.data.join("auth.json").exists());
+    }
+    #[test]
+    fn unmanaged_restart_failure_suggests_original_launcher_and_rolls_back() {
+        let t = tempfile::tempdir().unwrap();
+        let mut a = app(t.path());
+        fs::create_dir(&a.data).unwrap();
+        a.prepare().unwrap();
+        atomic(&a.data.join("auth.json"), br#"{"active":1}"#).unwrap();
+        atomic(&a.data.join("current"), b"old\n").unwrap();
+        atomic(&a.accounts().join("work.json.json"), br#"{"new":1}"#).unwrap();
+        fake_codex(
+            &mut a,
+            r#"case "$*" in
+            'app-server daemon version') echo '{"status":"running"}' ;;
+            'app-server daemon restart') echo 'Error: app server is running but is not managed by codex app-server daemon' >&2; exit 1 ;;
+            *) exit 3 ;;
+        esac"#,
+        );
+        let o = options(&["--internal-direct".into()]).unwrap();
+        let message = a
+            .auth_use(Some("work.json.json"), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("original launcher"));
+        assert!(message.contains("on the host where this command ran"));
+        assert!(message.contains("codex-appserver-ctl auth use work.json.json --no-restart"));
+        assert_eq!(
+            fs::read(a.data.join("auth.json")).unwrap(),
+            br#"{"active":1}"#
+        );
+        assert_eq!(fs::read(a.data.join("current")).unwrap(), b"old\n");
     }
     #[test]
     fn ssh_config_words_keep_quoted_paths_and_comments() {
