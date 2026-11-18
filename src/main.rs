@@ -330,12 +330,13 @@ impl App {
                     .ok_or_else(|| err("invalid selection"))?
             }
         };
-        let profile = self.accounts().join(format!("{n}.json"));
+        let profile_file = format!("{n}.json");
+        let profile = self.accounts().join(&profile_file);
         if !self.secure(&profile) {
             if matches!(fs::symlink_metadata(&profile), Err(e) if e.kind() == io::ErrorKind::NotFound)
             {
                 return Err(err(format!(
-                    "profile '{n}' not found on this host; run `codex-appserver-ctl auth login {n} --timeout 900` first"
+                    "profile '{n}' not found on this host; on the host where this command ran, run `codex-appserver-ctl auth login {profile_file} --timeout 900` first"
                 )));
             }
             return Err(err("profile must be an owned 0600 JSON file"));
@@ -349,7 +350,7 @@ impl App {
             return Ok(());
         }
         if o.restart && !o.internal && self.within()? {
-            return self.schedule(&["auth", "use", &n], o);
+            return self.schedule(&["auth", "use", &profile_file], o);
         }
         let _lock = self.lock(o.timeout)?;
         self.prepare()?;
@@ -376,11 +377,12 @@ impl App {
             if a.is_err() || b.is_err() {
                 return Err(err(format!("{e}; auth rollback failed")));
             }
-            if e.to_string()
-                .contains("not managed by codex app-server daemon")
+            let message = e.to_string();
+            if message.contains("not managed by codex app-server daemon")
+                || message == "cannot restart an unmanaged standalone server"
             {
                 return Err(err(format!(
-                    "{e}; profile selection was rolled back; run `codex-appserver-ctl auth use {n} --no-restart` and restart the app-server with its original launcher"
+                    "{e}; profile selection was rolled back; on the host where this command ran, run `codex-appserver-ctl auth use {profile_file} --no-restart` and restart the app-server with its original launcher"
                 )));
             }
             return Err(e);
@@ -1540,9 +1542,13 @@ mod tests {
         fs::create_dir(&a.data).unwrap();
         atomic(&a.data.join("auth.json"), br#"{"active":1}"#).unwrap();
         let o = options(&["--no-restart".into()]).unwrap();
-        let message = a.auth_use(Some("work.json"), &o).unwrap_err().to_string();
-        assert!(message.contains("profile 'work' not found on this host"));
-        assert!(message.contains("codex-appserver-ctl auth login work --timeout 900"));
+        let message = a
+            .auth_use(Some("work.json.json"), &o)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("profile 'work.json' not found on this host"));
+        assert!(message.contains("on the host where this command ran"));
+        assert!(message.contains("codex-appserver-ctl auth login work.json.json --timeout 900"));
         assert_eq!(
             fs::read(a.data.join("auth.json")).unwrap(),
             br#"{"active":1}"#
@@ -1587,7 +1593,7 @@ mod tests {
         a.prepare().unwrap();
         atomic(&a.data.join("auth.json"), br#"{"active":1}"#).unwrap();
         atomic(&a.data.join("current"), b"old\n").unwrap();
-        atomic(&a.accounts().join("work.json"), br#"{"new":1}"#).unwrap();
+        atomic(&a.accounts().join("work.json.json"), br#"{"new":1}"#).unwrap();
         fake_codex(
             &mut a,
             r#"case "$*" in
@@ -1597,9 +1603,13 @@ mod tests {
         esac"#,
         );
         let o = options(&["--internal-direct".into()]).unwrap();
-        let message = a.auth_use(Some("work"), &o).unwrap_err().to_string();
+        let message = a
+            .auth_use(Some("work.json.json"), &o)
+            .unwrap_err()
+            .to_string();
         assert!(message.contains("original launcher"));
-        assert!(message.contains("codex-appserver-ctl auth use work --no-restart"));
+        assert!(message.contains("on the host where this command ran"));
+        assert!(message.contains("codex-appserver-ctl auth use work.json.json --no-restart"));
         assert_eq!(
             fs::read(a.data.join("auth.json")).unwrap(),
             br#"{"active":1}"#

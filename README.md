@@ -161,7 +161,8 @@ The tool uses the Codex daemon commands for a managed server.
 On macOS, it can stop and reopen an app-hosted server in ChatGPT or Codex.
 An unmanaged server requires its own launcher to restart.
 If profile selection fails because a server is unmanaged, the previous authentication
-is restored. Use `auth use NAME --no-restart`, then restart it with its original launcher.
+is restored. Run `auth use NAME --no-restart` on the host where selection failed,
+then restart the server with its original launcher.
 Use `--force` to permit SIGKILL if a graceful stop fails.
 
 A command that must restart its own parent server runs in a detached process.
